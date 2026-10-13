@@ -11,9 +11,9 @@
 ## 2. Repository settings (maintainer, before merge)
 
 - [ ] 2.1 Create the `AUTOMATION_TOKEN` repository secret (fine-grained PAT with contents and pull-requests write); verify by checking Settings, Secrets and variables, Actions.
-- [ ] 2.2 Run `scripts/setup-github.sh --dry-run`, review the printed calls, then run it for real; verify `gh repo view --json defaultBranchRef` reports `develop` and `gh api repos/kkaminsk/Kimi-JevCompact/rulesets` lists `main`, `develop`, `branch-naming`.
+- [x] 2.2 Run `scripts/setup-github.sh --dry-run`, review the printed calls, then run it for real; verify `gh repo view --json defaultBranchRef` reports `develop` and `gh api repos/kkaminsk/Kimi-JevCompact/rulesets` lists `main`, `develop`, `branch-naming`.
 - [ ] 2.3 Add required reviewers to the `production` environment; verify in Settings, Environments.
-- [ ] 2.4 Retarget this change's pull request to `develop` and confirm `openspec-gate`, `conventional-title`, `build-test`, and `docs-check` all report; verify in the PR checks panel.
+- [x] 2.4 Retarget this change's pull request to `develop` and confirm `openspec-gate`, `conventional-title`, `build-test`, and `docs-check` all report; verify in the PR checks panel.
 
 ## 3. Reconcile existing proposals
 
