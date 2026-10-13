@@ -1,0 +1,18 @@
+{
+  // Documentation lint for docs-check. Stylistic rules that fight the wide
+  // branch tables and the @AGENTS.md import line are off. Structural rules stay on.
+  "config": {
+    "default": true,
+    "MD013": false, // line length: tables are wide by design
+    "MD060": false, // table column style: compact pipes are fine
+    "MD033": false, // inline HTML: PR template comments and README anchors
+    "MD041": false  // first line heading: CLAUDE.md starts with @AGENTS.md
+  },
+  "ignores": [
+    "node_modules/**",
+    ".claude/**",
+    ".kimi-code/**",
+    "openspec/changes/archive/**",
+    "CHANGELOG.md"
+  ]
+}

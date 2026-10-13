@@ -50,6 +50,17 @@ openspec show precompact-prune-hook-contract
 Research notes on the Kimi Code source that shaped these proposals are in
 [`docs/research/kimi-code-compaction-seams.md`](docs/research/kimi-code-compaction-seams.md).
 
+## Contributing
+
+This repository follows the [kkaminsk/GithubStandards](https://github.com/kkaminsk/GithubStandards)
+kit: Git Flow lite with OpenSpec. `main` is production, `develop` is the default
+branch, and every `feature/`, `docs/`, or `hotfix/` branch is named after an
+OpenSpec change id. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the human
+workflow, [`docs/BRANCHING.md`](docs/BRANCHING.md) for the full standard and
+runbooks, and [`AGENTS.md`](AGENTS.md) for the rules agents follow.
+
+Work is tracked in the Linear project "Kimi-JevCompact", one issue per proposal.
+
 ## License
 
 MIT

@@ -18,9 +18,11 @@ Files: `packages/agent-core-v2/src/agent/contextMemory/{contextEvents,contextOps
 ## Capabilities
 
 ### New Capabilities
+
 - `prune-record-persistence`: A prune is stored as a durable record, applied deterministically, and reproduced identically by every component that replays a session.
 
 ### Modified Capabilities
+
 <!-- None in this repository. -->
 
 ## Impact

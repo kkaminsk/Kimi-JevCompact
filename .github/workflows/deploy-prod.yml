@@ -1,0 +1,54 @@
+# Production build. A published GitHub Release (created by release-please)
+# runs the production job for the tagged commit.
+#
+# Required reviewers on the production environment are the deploy gate.
+# Configure them under Settings -> Environments -> production.
+#
+# Kimi-JevCompact has no deployment target: users install the plugin from
+# this repository at a tag. The {{DEPLOY_PROD_CMD}} step therefore only
+# records the release. Replace it if release assets (for example a prebuilt
+# kimi-jev binary, see openspec/changes/fork-build-and-distribution) are
+# published later.
+name: Deploy prod
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Production runs queue in order and are never cancelled.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # {{SETUP_CMD}}
+      - name: Setup
+        run: |
+          if [[ -f package.json ]]; then npm ci; else echo "no package.json yet (see openspec/changes/scaffold-kimi-jevcompact)"; fi
+
+      # {{BUILD_CMD}}
+      - name: Build
+        run: |
+          if [[ -f package.json ]]; then npm run build; else echo "no package.json yet"; fi
+
+      # {{DEPLOY_PROD_CMD}}
+      - name: Deploy to production
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          echo "No production deployment target. Release ${TAG} is installable from the repository."

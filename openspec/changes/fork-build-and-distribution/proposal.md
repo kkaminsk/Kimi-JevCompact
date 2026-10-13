@@ -16,9 +16,11 @@ The three fork patches are useless until someone can build and run a Kimi binary
 ## Capabilities
 
 ### New Capabilities
+
 - `fork-distribution`: A reproducible way to build, install, update, and verify the patched Kimi binary, plus the material to propose the patch upstream.
 
 ### Modified Capabilities
+
 <!-- None. -->
 
 ## Impact

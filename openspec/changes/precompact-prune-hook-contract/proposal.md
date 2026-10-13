@@ -19,9 +19,11 @@ Files: `packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHoo
 ## Capabilities
 
 ### New Capabilities
+
 - `precompact-prune-contract`: The `PreCompact` hook payload exposes the history and the hook may return a validated prune decision that Kimi will honour.
 
 ### Modified Capabilities
+
 <!-- None in this repository. -->
 
 ## Impact
