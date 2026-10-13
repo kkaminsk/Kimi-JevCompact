@@ -13,6 +13,7 @@
     ".claude/**",
     ".kimi-code/**",
     "openspec/changes/archive/**",
+    "openspec/specs/**",
     "CHANGELOG.md"
   ]
 }
