@@ -1,0 +1,42 @@
+schema: spec-driven
+
+context: |
+  Project: Kimi-JevCompact — verbatim, Jev-guided context compaction for Kimi Code CLI.
+  It is the Kimi Code counterpart of fast-jev-compaction (Claude Code plugin + npm library).
+
+  Architecture (decided 2026-10-13): fork Kimi Code with a native hook.
+  - Upstream: MoonshotAI/kimi-code, TypeScript pnpm monorepo, MIT. Pinned at commit b510fa9
+    (2026-10-13, app version 2.1.1). Engine package: packages/agent-core-v2.
+  - Fork: kkaminsk/kimi-code, branch `jev-compaction`, patched build distributed as `kimi-jev`.
+  - Extension point: the existing shell hook event `PreCompact` becomes a mutating hook.
+    Its payload gains the agent history; its structured stdout may return a prune decision
+    (tool call ids to drop, tool results to truncate). Kimi applies the prune itself and
+    skips the model-written summary when the prune frees enough context.
+  - Plugin: a normal Kimi plugin (kimi.plugin.json) that declares the PreCompact hook.
+    The hook command is a bundled Node script that uses the npm library
+    fast-jev-compaction (0.4.1) to score every tool call with TypeSafe's Jev model.
+  - Guarantee carried over from fast-jev-compaction: user and assistant text is never
+    rewritten; only tool calls and tool results are dropped or truncated.
+
+  Conventions: TypeScript strict, ESM, vitest, conventional commits. Secrets never in files
+  under version control. Hook payload fields are snake_case (Kimi convention); keys inside
+  hookSpecificOutput are camelCase (matches Kimi's existing permissionDecision).
+
+  Key upstream files (relative to the kimi-code repo):
+  - packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts (compaction run loop)
+  - packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts (PreCompact/PostCompact dispatch)
+  - packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts (stdout JSON schema)
+  - packages/agent-core-v2/src/agent/contextMemory/{contextEvents,contextOps,contextMemory}.ts (durable context records)
+  - packages/agent-core-v2/src/agent/replayBuilder/fold.ts, human/persist/v2/{fold,wire}.ts, packages/node-sdk/src/v2/resume-replay.ts, packages/transcript/src/history/foldFacts.ts, apps/vis/server/src/lib/{agent-record-types,context-projector}.ts (replay consumers)
+  - docs/en/customization/hooks.md, docs/en/customization/plugins.md
+
+rules:
+  proposal:
+    - Keep proposals under 600 words
+    - Name the upstream kimi-code files a fork change touches
+  specs:
+    - Requirements describe observable behaviour of Kimi, the hook, or the plugin; never class names
+  design:
+    - Every decision lists at least one rejected alternative
+  tasks:
+    - Every task states its verification
