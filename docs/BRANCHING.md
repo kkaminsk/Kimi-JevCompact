@@ -98,6 +98,13 @@ Auto-merge is off by default. The workflow file explains how to enable it.
 
 Import them with `scripts/setup-github.ps1` or `scripts/setup-github.sh`.
 
+Solo-maintainer exception: `main.json` and `develop.json` list repository
+admins as a bypass actor (`RepositoryRole` 5, mode `always`). GitHub does not
+let an author approve their own PR, and this repository has one maintainer, so
+without the bypass nothing could merge. The four CI checks still run and must
+be green before an admin merges. Remove the bypass when a second reviewer
+joins.
+
 Automated PRs (promote, release-please, sync) need the `AUTOMATION_TOKEN`
 secret. PRs created with the default workflow token do not trigger CI, so the
 required checks would never report and the PR could not merge.
