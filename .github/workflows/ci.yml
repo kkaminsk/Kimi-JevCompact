@@ -1,0 +1,209 @@
+# Pull request checks for main and develop.
+#
+# Rulesets require four checks by name: openspec-gate, conventional-title,
+# build-test, docs-check. Jobs carry no `name:` so the check context equals
+# the job id. build-test and docs-check always run and short-circuit when they
+# do not apply, so every required check reports on every PR.
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+# A newer push to the same PR branch supersedes the running checks.
+concurrency:
+  group: ci-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  openspec-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check branch name and OpenSpec change
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+
+          # The release promotion PR and automation branches are exempt.
+          if [[ "$BRANCH" == "develop" ]] || [[ "$BRANCH" =~ ^release-please-- ]] || [[ "$BRANCH" =~ ^sync/ ]]; then
+            echo "skipped"
+            exit 0
+          fi
+
+          if [[ ! "$BRANCH" =~ ^(feature|docs|hotfix)/([a-z0-9]+(-[a-z0-9]+)*)$ ]]; then
+            echo "::error::Branch '$BRANCH' does not follow the naming rule."
+            echo "Branches are named <prefix>/<id>. Prefix is feature, docs, or hotfix."
+            echo "<id> is lowercase and hyphenated, for example add-dark-mode."
+            echo "<id> must equal an OpenSpec change folder: openspec/changes/<id>/"
+            exit 1
+          fi
+          ID="${BASH_REMATCH[2]}"
+          echo "OpenSpec change id: $ID"
+
+          CHANGE_DIR="openspec/changes/$ID"
+          ARCHIVED=0
+          if [[ -f "$CHANGE_DIR/proposal.md" && -f "$CHANGE_DIR/tasks.md" ]]; then
+            echo "Found active change at $CHANGE_DIR"
+          else
+            # The PR may already carry the archive commit.
+            MATCH=$(find openspec/changes/archive -mindepth 1 -maxdepth 1 -type d -name "*-$ID" 2>/dev/null | sort | tail -n 1 || true)
+            if [[ -z "$MATCH" ]]; then
+              echo "::error::Missing openspec/changes/$ID/proposal.md and tasks.md, and no folder openspec/changes/archive/*-$ID/."
+              echo "Create the change first: /opsx:new $ID then /opsx:ff"
+              exit 1
+            fi
+            CHANGE_DIR="$MATCH"
+            ARCHIVED=1
+            echo "Found archived change at $CHANGE_DIR"
+          fi
+
+          TASKS="$CHANGE_DIR/tasks.md"
+          if [[ -f "$TASKS" ]] && grep -Eq '^\s*- \[ \]' "$TASKS"; then
+            echo "::error::$TASKS has unchecked tasks. Finish them before the PR leaves draft."
+            grep -En '^\s*- \[ \]' "$TASKS"
+            exit 1
+          fi
+
+          # openspec validate only knows active changes. The archive commit is
+          # expected to be the final commit of the PR, so skip it there.
+          if [[ "$ARCHIVED" -eq 1 ]]; then
+            echo "Change is archived. Strict validation skipped."
+            exit 0
+          fi
+
+          # --yes uses the devDependency when present and downloads otherwise.
+          npx --yes @fission-ai/openspec validate "$ID" --strict
+
+  # Shell regex, no third-party action. The pattern is the standard verbatim.
+  conventional-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          RE='^(feat|fix|docs|chore|refactor|ci|test|perf)(\([a-z0-9-]+\))?!?: .+'
+          if [[ "$TITLE" =~ $RE ]]; then
+            echo "PR title ok: $TITLE"
+          else
+            echo "::error::PR title '$TITLE' is not a Conventional Commit."
+            echo "Format: <type>(<optional scope>)!: <imperative summary>"
+            echo "Types: feat, fix, docs, chore, refactor, ci, test, perf"
+            exit 1
+          fi
+
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      # Always reports. docs/* branches short-circuit here and pass.
+      - name: Decide whether this job applies
+        id: gate
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          if [[ "$BRANCH" == docs/* ]]; then
+            echo "not applicable for this branch prefix"
+            echo "applicable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "applicable=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.applicable == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.applicable == 'true'
+        with:
+          node-version: 20
+
+      # The npm scripts below are defined by the OpenSpec change
+      # scaffold-kimi-jevcompact. Until that change lands there is no
+      # package.json, so each step passes with a notice instead of failing
+      # every PR. Remove the guards once the manifest exists.
+
+      # {{SETUP_CMD}}
+      - name: Setup
+        if: steps.gate.outputs.applicable == 'true'
+        run: |
+          if [[ -f package.json ]]; then npm ci; else echo "no package.json yet (see openspec/changes/scaffold-kimi-jevcompact)"; fi
+
+      # {{LINT_CMD}}
+      - name: Lint
+        if: steps.gate.outputs.applicable == 'true'
+        run: |
+          if [[ -f package.json ]]; then npm run typecheck; else echo "no package.json yet"; fi
+
+      # {{BUILD_CMD}}
+      - name: Build
+        if: steps.gate.outputs.applicable == 'true'
+        run: |
+          if [[ -f package.json ]]; then npm run build; else echo "no package.json yet"; fi
+
+      # {{TEST_CMD}}
+      - name: Test
+        if: steps.gate.outputs.applicable == 'true'
+        run: |
+          if [[ -f package.json ]]; then npm test; else echo "no package.json yet"; fi
+          bash scripts/test-ci-logic.sh
+
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      # Always reports. Non-docs branches short-circuit here and pass.
+      - name: Decide whether this job applies
+        id: gate
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          if [[ "$BRANCH" == docs/* ]]; then
+            echo "applicable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "not applicable for this branch prefix"
+            echo "applicable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.applicable == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Fail if any changed path is outside docs/**, **/*.md, openspec/**
+        if: steps.gate.outputs.applicable == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          CHANGED=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+          BAD=()
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            case "$f" in
+              docs/*|*.md|openspec/*) ;;
+              *) BAD+=("$f") ;;
+            esac
+          done <<< "$CHANGED"
+          if (( ${#BAD[@]} > 0 )); then
+            echo "::error::docs/* branches may only touch docs/**, *.md, and openspec/**."
+            printf 'Not allowed: %s\n' "${BAD[@]}"
+            exit 1
+          fi
+
+      # {{DOCS_CHECK_CMD}}: markdownlint with the repo config in .markdownlint-cli2.jsonc.
+      - name: Validate documentation
+        if: steps.gate.outputs.applicable == 'true'
+        run: |
+          npx --yes markdownlint-cli2 "**/*.md"

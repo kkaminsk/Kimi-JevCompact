@@ -18,9 +18,11 @@ Files: `packages/agent-core-v2/src/agent/fullCompaction/{fullCompactionService,t
 ## Capabilities
 
 ### New Capabilities
+
 - `compaction-prune-orchestration`: Compaction honours a prune decision, falls back to summary only when needed, and reports which mode ran.
 
 ### Modified Capabilities
+
 <!-- None in this repository. -->
 
 ## Impact

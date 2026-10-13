@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a change to application code, shipped with the next release.
+title: "feat: "
+labels: [openspec]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The change id becomes the branch `feature/<id>` and the folder `openspec/changes/<id>/`.
+  - type: input
+    id: openspec-change-id
+    attributes:
+      label: Proposed OpenSpec change id
+      description: Lowercase, hyphenated, verb-first.
+      placeholder: add-dark-mode
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is missing or wrong today? Who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What should change, in two to five sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable outcomes a reviewer can check.
+      placeholder: |
+        - When ..., then ...
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

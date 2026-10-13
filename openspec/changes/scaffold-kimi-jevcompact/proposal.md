@@ -15,9 +15,11 @@ Kimi-JevCompact needs a repository that can hold three different kinds of artefa
 ## Capabilities
 
 ### New Capabilities
+
 - `repo-toolchain`: The repository builds, tests, and validates reproducibly, and produces the single-file hook bundle the plugin needs.
 
 ### Modified Capabilities
+
 <!-- None: first change in the repository. -->
 
 ## Impact
