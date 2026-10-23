@@ -15,10 +15,11 @@
 ## 3. Repository layout and docs
 
 - [ ] 3.1 Create `plugin/kimi.plugin.json` placeholder (name `kimi-jevcompact`, version `0.0.0`), `plugin/README.md`, `fork/README.md`, `fork/upstream.lock` (`sha: b510fa9`, `version: 2.1.1`, `date: 2026-10-13`), `fork/patches/.gitkeep`; verify the tree matches the layout in the spec.
-- [ ] 3.2 Write `CONTRIBUTING.md`: conventional commits, Node 20 for the hook, Node 24.15 + pnpm 10.33 for the fork, where each artefact lives, "never commit a key"; verify it links to `docs/research/kimi-code-compaction-seams.md`.
+- [ ] 3.2 Extend the existing `CONTRIBUTING.md` (from `adopt-github-standards`) with the `npm ci` setup step, where each artefact lives, and the fork toolchain details; verify it still passes markdownlint and links to `docs/research/kimi-code-compaction-seams.md`.
 - [ ] 3.3 Extend `.gitignore` to cover `kimi-jevcompact.json`, `.env`, `plugin/dist/`, and `fork/build/`; verify `git check-ignore kimi-jevcompact.json` prints the path.
 
 ## 4. Continuous integration
 
-- [ ] 4.1 Add `.github/workflows/ci.yml` running `npm ci && npm run verify` on Node 20 and 22, triggered on push and pull_request; verify the workflow passes on the PR that adds it.
-- [ ] 4.2 Add `openspec validate --all` to `verify` (via `npx openspec`); verify it passes with the seven existing changes.
+- [ ] 4.1 Make the `build-test` job in the existing `.github/workflows/ci.yml` run `npm run verify` on a Node 20 and 22 matrix; verify the workflow passes on the PR that adds it.
+- [ ] 4.2 Add `@fission-ai/openspec` as a devDependency and `openspec validate --all` to `verify`; verify it passes with the existing changes.
+- [ ] 4.3 Remove the `package.json` guards from `build-test`, `deploy-dev.yml`, and `deploy-prod.yml` (added by `adopt-github-standards`) and switch `release-please-config.json` to `release-type: node`; verify CI runs the real `npm` steps on this change's pull request.

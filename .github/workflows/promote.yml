@@ -1,0 +1,69 @@
+# Release promotion. A maintainer runs this by hand. It opens or updates the
+# PR from develop to main whose squash merge becomes the release commit.
+#
+# The PR body is one commit subject per paragraph. release-please parses each
+# paragraph that starts with a Conventional type (feat:, fix:, ...) as its own
+# change. Squash merging collapses develop into one commit, so without this
+# body release-please would see only a hidden chore commit and cut no release.
+# Do not reformat the body. Remove a paragraph only if it must not ship.
+name: Promote develop to main
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      # PRs opened with GITHUB_TOKEN do not trigger pull_request workflows,
+      # so the promotion PR would never get its required checks. Set
+      # AUTOMATION_TOKEN to a fine-grained PAT or GitHub App token with
+      # contents and pull-requests write.
+      GH_TOKEN: ${{ secrets.AUTOMATION_TOKEN || secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          token: ${{ secrets.AUTOMATION_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build the PR body from develop commits not on main
+        id: body
+        run: |
+          set -euo pipefail
+          git fetch origin main develop
+          COUNT=$(git rev-list --count origin/main..origin/develop)
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "::error::develop has no commits that are not already on main. Nothing to promote."
+            exit 1
+          fi
+          echo "$COUNT commit(s) to promote."
+          # %s%n prints the subject then a newline. git log adds a blank line
+          # between entries, so each subject becomes its own paragraph.
+          git log origin/main..origin/develop --no-merges --format='%s%n' > body.txt
+          echo "---- body.txt ----"
+          cat body.txt
+
+      - name: Open or update the promotion PR
+        run: |
+          set -euo pipefail
+          TITLE="chore(release): promote develop"
+          EXISTING=$(gh pr list --base main --head develop --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$EXISTING" ]]; then
+            echo "PR #$EXISTING is open. Updating its body."
+            gh pr edit "$EXISTING" --title "$TITLE" --body-file body.txt
+          else
+            # The release label is created by scripts/setup-github.*. Fall
+            # back to an unlabelled PR rather than failing the promotion.
+            gh pr create --base main --head develop --title "$TITLE" --body-file body.txt --label release \
+            || gh pr create --base main --head develop --title "$TITLE" --body-file body.txt
+          fi

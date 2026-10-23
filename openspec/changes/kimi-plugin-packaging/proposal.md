@@ -16,9 +16,11 @@ Users should install Kimi-JevCompact the way they install any Kimi plugin: `/plu
 ## Capabilities
 
 ### New Capabilities
+
 - `kimi-plugin`: Kimi-JevCompact installs, enables, and operates as a standard Kimi plugin with user-facing commands for status, diagnosis, and setup.
 
 ### Modified Capabilities
+
 <!-- None. -->
 
 ## Impact

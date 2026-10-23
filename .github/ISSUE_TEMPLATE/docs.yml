@@ -1,0 +1,31 @@
+name: Documentation
+description: Documentation-only change. Ships from a docs/ branch straight to main.
+title: "docs: "
+labels: [openspec, docs]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The change id becomes the branch `docs/<id>` and the folder `openspec/changes/<id>/`.
+        If the docs change belongs to a feature, add it to that feature instead.
+  - type: input
+    id: openspec-change-id
+    attributes:
+      label: Proposed OpenSpec change id
+      description: Lowercase, hyphenated, verb-first.
+      placeholder: document-api
+    validations:
+      required: true
+  - type: textarea
+    id: location
+    attributes:
+      label: Which documents
+      description: Paths or page titles that need to change.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: What should change
+    validations:
+      required: true

@@ -16,9 +16,11 @@ The fork gives `PreCompact` a way to return a prune decision; something has to p
 ## Capabilities
 
 ### New Capabilities
+
 - `jev-prune-hook`: A `PreCompact` hook executable that turns Kimi's history into a Jev-scored prune decision, with fail-open behaviour and local diagnostics.
 
 ### Modified Capabilities
+
 <!-- None. -->
 
 ## Impact

@@ -1,0 +1,30 @@
+# On every push to main, release-please opens or updates a release PR that
+# bumps the version and writes CHANGELOG.md from Conventional Commit subjects.
+# Merging that PR creates the tag and the GitHub Release that deploys prod.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          # PRs opened with GITHUB_TOKEN do not trigger pull_request workflows,
+          # so the release PR would never get its required checks. Set
+          # AUTOMATION_TOKEN to a fine-grained PAT or GitHub App token with
+          # contents and pull-requests write.
+          token: ${{ secrets.AUTOMATION_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

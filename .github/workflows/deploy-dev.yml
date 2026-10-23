@@ -1,0 +1,45 @@
+# Dev build. Every push to develop runs the development job.
+#
+# Kimi-JevCompact has no deployment target: the plugin is installed straight
+# from this repository (see openspec/changes/kimi-plugin-packaging). The
+# {{DEPLOY_DEV_CMD}} step therefore only records the commit. Replace it if a
+# dev distribution (for example a prerelease zip) is added later.
+name: Deploy dev
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+# Only the newest develop commit matters. Cancel a superseded run.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # {{SETUP_CMD}}
+      - name: Setup
+        run: |
+          if [[ -f package.json ]]; then npm ci; else echo "no package.json yet (see openspec/changes/scaffold-kimi-jevcompact)"; fi
+
+      # {{BUILD_CMD}}
+      - name: Build
+        run: |
+          if [[ -f package.json ]]; then npm run build; else echo "no package.json yet"; fi
+
+      # {{DEPLOY_DEV_CMD}}
+      - name: Deploy to development
+        run: |
+          echo "No dev deployment target. develop is at ${GITHUB_SHA}."

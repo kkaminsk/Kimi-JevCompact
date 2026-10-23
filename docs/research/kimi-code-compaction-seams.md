@@ -25,7 +25,7 @@ Read on 2026-10-13 while designing Kimi-JevCompact. Paths are relative to the ki
   (`requestKind: 'full_compaction'`), collects the reply as `summary`, and calls
   `context.applyCompaction({ summary, contextSummary, compactedCount: history.length, ... })`.
   Shape (`contextMemory/compactionHandoff.ts`): kept user messages (head/tail, 20k-token cap)
-  + one `compaction_summary` user message + a continuation message. Trigger thresholds in
+  plus one `compaction_summary` user message + a continuation message. Trigger thresholds in
   `fullCompaction/strategy.ts`: `triggerRatio` 0.85, `reservedContextSize` 50k, with
   `shouldCompact` / `shouldBlock`.
 - **Durable records** (`contextMemory/contextEvents.ts`): `context.append_message`,

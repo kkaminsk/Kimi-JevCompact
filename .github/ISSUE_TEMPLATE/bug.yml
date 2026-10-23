@@ -1,0 +1,49 @@
+name: Bug report
+description: Something is broken. Fixes ship as feature/ (next release) or hotfix/ (immediate patch).
+title: "fix: "
+labels: [openspec]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The change id becomes the branch `feature/<id>` or `hotfix/<id>` and the folder `openspec/changes/<id>/`.
+  - type: input
+    id: openspec-change-id
+    attributes:
+      label: Proposed OpenSpec change id
+      description: Lowercase, hyphenated, verb-first.
+      placeholder: fix-login-timeout
+    validations:
+      required: true
+  - type: dropdown
+    id: urgency
+    attributes:
+      label: Urgency
+      options:
+        - Next release (feature/ branch from develop)
+        - Production is broken (hotfix/ branch from main)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v1.2.3 or short SHA

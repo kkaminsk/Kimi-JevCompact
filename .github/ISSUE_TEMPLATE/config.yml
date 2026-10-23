@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Branching standard
+    url: https://github.com/kkaminsk/Kimi-JevCompact/blob/main/docs/BRANCHING.md
+    about: How branches, OpenSpec changes, and releases work in this repository.
