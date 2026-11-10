@@ -21,6 +21,7 @@ apply to. Upstream moves fast; this is the bounded procedure to move with it.
    git am --3way /path/to/fork/patches/<conflicting patch>   # resolve here
    git am --3way /path/to/fork/patches/<remaining patches>
    ```
+
    Resolve conflicts by keeping upstream's refactors and re-applying the
    prune behaviour on top. Run the package tests
    (`corepack pnpm --filter @moonshot-ai/agent-core-v2 test` and
