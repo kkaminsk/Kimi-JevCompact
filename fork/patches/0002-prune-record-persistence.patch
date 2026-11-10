@@ -1,4 +1,4 @@
-From 67273bc479e30c81f786a52b45223f38c4b2b5f3 Mon Sep 17 00:00:00 2001
+From ecf758d4ace34293438788650e0c1a227cd03613 Mon Sep 17 00:00:00 2001
 From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
 Date: Tue, 10 Nov 2026 14:57:45 -0600
 Subject: [PATCH] feat(context-memory): persist prunes as durable
@@ -45,12 +45,13 @@ across platforms.
  .../toolSelect/toolSelectService.test.ts      |   4 +
  .../test/agent/undo/undo.test.ts              |  20 +++
  .../externalHooks/integration.test.ts         |  11 +-
+ packages/agent-core-v2/test/index.test.ts     |   1 +
  .../agent-core-v2/test/wire/resume.test.ts    |  67 +++++++++
  .../agent-core-v2/test/wire/tree/fork.test.ts |  88 ++++++++++++
  .../node-sdk/test/sdk-rpc-client-v2.test.ts   |  51 +++++++
  packages/transcript/src/history/foldFacts.ts  |   2 +
  packages/transcript/test/layers.test.ts       |  29 ++++
- 28 files changed, 1107 insertions(+), 12 deletions(-)
+ 29 files changed, 1108 insertions(+), 12 deletions(-)
  create mode 100644 apps/vis/web/src/components/context/PruneRibbon.tsx
  create mode 100644 packages/agent-core-v2/test/agent/contextMemory/pruneRecord.test.ts
  create mode 100644 packages/agent-core-v2/test/wire/tree/fork.test.ts
@@ -1368,6 +1369,18 @@ index 977caf5c8..005451856 100644
      } finally {
        harness.ix.dispose();
        disposables.dispose();
+diff --git a/packages/agent-core-v2/test/index.test.ts b/packages/agent-core-v2/test/index.test.ts
+index b780f8b7d..8fd54fee3 100644
+--- a/packages/agent-core-v2/test/index.test.ts
++++ b/packages/agent-core-v2/test/index.test.ts
+@@ -64,6 +64,7 @@ const V1_RECORD_TYPES: ReadonlySet<string> = new Set([
+   'context.append_loop_event',
+   'context.clear',
+   'context.apply_compaction',
++  'context.apply_prune',
+   'context.undo',
+   'goal.create',
+   'goal.update',
 diff --git a/packages/agent-core-v2/test/wire/resume.test.ts b/packages/agent-core-v2/test/wire/resume.test.ts
 index b92fbf53d..f7b178da0 100644
 --- a/packages/agent-core-v2/test/wire/resume.test.ts
