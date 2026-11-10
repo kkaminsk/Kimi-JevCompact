@@ -12,6 +12,7 @@
     "node_modules/**",
     ".claude/**",
     ".kimi-code/**",
+    "fork/build/**",
     "openspec/changes/archive/**",
     "openspec/specs/**",
     "CHANGELOG.md"

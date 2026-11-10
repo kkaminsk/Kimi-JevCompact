@@ -1,0 +1,1718 @@
+From e75c9c72653cbf4d98347c9c3ee8f008f01bc7c4 Mon Sep 17 00:00:00 2001
+From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
+Date: Tue, 10 Nov 2026 14:57:45 -0600
+Subject: [PATCH] feat(context-memory): persist prunes as durable
+ context.apply_prune records
+
+A prune decision now lands as one durable wire record holding the dropped
+tool call ids, the truncated results with headChars, the trigger, the token
+counts before and after, the number of whole messages removed, and the
+optional note. A new pure applyPruneRecord in contextOps drops calls and
+their tool messages, removes assistant messages left with no text and no
+calls, truncates results to a head plus the omission note, and throws on
+unknown ids; the live service applies it through IAgentContextMemoryService
+.applyPrune, rebases the token count, and bumps the prefix revision.
+
+Every replayer handles the record through the same function: the engine
+replay fold, the v2 persistence fold, the node SDK resume fold, the context
+transcript reducer, and the session visualiser (which also renders a prune
+ribbon with the dropped and truncated counts). A prune is neither an undo
+nor a fork boundary, so undo and fork lines walk straight through it; the
+transcript fold keeps it out of the undo-anchor floor as well. The wire
+manifest generator now emits POSIX owner paths so its output is stable
+across platforms.
+---
+ apps/vis/server/src/lib/agent-record-types.ts |   2 +
+ apps/vis/server/src/lib/context-projector.ts  |  51 ++++++-
+ .../server/test/lib/context-projector.test.ts | 126 +++++++++++++++++
+ .../web/src/components/context/ContextTab.tsx |   4 +
+ .../src/components/context/PruneRibbon.tsx    |  28 ++++
+ .../vis/web/src/components/wire/renderers.tsx |  30 +++-
+ .../agent-core-v2/docs/wire-manifest.d.ts     |  23 ++-
+ .../scripts/gen-wire-manifest.mts             |  14 +-
+ .../src/agent/contextMemory/contextEvents.ts  |  24 ++++
+ .../src/agent/contextMemory/contextMemory.ts  |  22 ++-
+ .../contextMemory/contextMemoryService.ts     |  40 +++++-
+ .../src/agent/contextMemory/contextOps.ts     |  86 +++++++++++-
+ .../agent/contextMemory/contextTranscript.ts  |  41 ++++++
+ .../src/agent/contextMemory/types.ts          |   2 +
+ .../src/agent/replayBuilder/fold.ts           |  32 +++++
+ .../src/human/persist/v2/fold.ts              |  71 +++++++++-
+ .../src/human/persist/v2/wire.ts              |  17 +++
+ .../agent/contextMemory/pruneRecord.test.ts   | 132 ++++++++++++++++++
+ .../agent/contextMemory/splice-replay.test.ts | 101 +++++++++++++-
+ .../test/agent/contextMemory/stubs.ts         |  16 ++-
+ .../toolSelect/toolSelectService.test.ts      |   4 +
+ .../test/agent/undo/undo.test.ts              |  20 +++
+ .../externalHooks/integration.test.ts         |  11 +-
+ .../agent-core-v2/test/wire/resume.test.ts    |  67 +++++++++
+ .../agent-core-v2/test/wire/tree/fork.test.ts |  88 ++++++++++++
+ .../node-sdk/test/sdk-rpc-client-v2.test.ts   |  51 +++++++
+ packages/transcript/src/history/foldFacts.ts  |   2 +
+ packages/transcript/test/layers.test.ts       |  29 ++++
+ 28 files changed, 1114 insertions(+), 20 deletions(-)
+ create mode 100644 apps/vis/web/src/components/context/PruneRibbon.tsx
+ create mode 100644 packages/agent-core-v2/test/agent/contextMemory/pruneRecord.test.ts
+ create mode 100644 packages/agent-core-v2/test/wire/tree/fork.test.ts
+
+diff --git a/apps/vis/server/src/lib/agent-record-types.ts b/apps/vis/server/src/lib/agent-record-types.ts
+index d591e263b..7cbcf79d8 100644
+--- a/apps/vis/server/src/lib/agent-record-types.ts
++++ b/apps/vis/server/src/lib/agent-record-types.ts
+@@ -73,6 +73,7 @@ import type {
+   ContextAppendLoopEvent,
+   ContextAppendMessage,
+   ContextApplyCompactionPayload,
++  ContextApplyPrunePayload,
+   ContextClear,
+   ContextUndo,
+ } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextEvents';
+@@ -167,6 +168,7 @@ export type AgentRecord =
+   | WireRecordOf<'context.append_loop_event', ContextAppendLoopEvent>
+   | WireRecordOf<'context.append_message', ContextAppendMessage>
+   | WireRecordOf<'context.apply_compaction', ContextApplyCompactionPayload>
++  | WireRecordOf<'context.apply_prune', ContextApplyPrunePayload>
+   | WireRecordOf<'context.clear', ContextClear>
+   | WireRecordOf<'context.undo', ContextUndo>
+   | WireRecordOf<'cron.add', CronAddPayload>
+diff --git a/apps/vis/server/src/lib/context-projector.ts b/apps/vis/server/src/lib/context-projector.ts
+index ae952525c..e540d1c60 100644
+--- a/apps/vis/server/src/lib/context-projector.ts
++++ b/apps/vis/server/src/lib/context-projector.ts
+@@ -5,6 +5,7 @@ import {
+   computeUndoCut,
+   isFullyUndoable,
+   readContextCompactionShapeInput,
++  applyPruneRecord,
+ } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextOps';
+ import { createLoopEventFold } from '@moonshot-ai/agent-core-v2/agent/contextMemory/loopEventFold';
+ import { renderToolResultForModel } from '@moonshot-ai/agent-core-v2/agent/contextMemory/toolResultRender';
+@@ -19,11 +20,13 @@ import type {
+ export interface ProjectedMessage {
+   lineNo: number;
+   time?: number;
+-  source: 'append_message' | 'compaction_summary' | 'undo' | 'clear';
++  source: 'append_message' | 'compaction_summary' | 'undo' | 'clear' | 'prune';
+   message: ContextMessage;
+   toolStepUuids: string[];
+   /** Set only when source === 'undo'. */
+   undo?: { count: number; removedMessageCount: number };
++  /** Set only when source === 'prune'. */
++  prune?: { droppedCalls: number; truncatedResults: number };
+   /** Set only on the summary bubble of source === 'compaction_summary'.
+    *  `tokensBefore`/`tokensAfter` are absent on legacy payload variants. */
+   compaction?: { compactedCount: number; tokensBefore?: number; tokensAfter?: number };
+@@ -432,6 +435,52 @@ export function projectContext(
+       case 'plan_mode.cancel':
+       case 'plan_mode.exit':
+         planActive = false; planId = undefined; break;
++      case 'context.apply_prune': {
++        // Mirror the engine's applyPrune: dropped calls vanish from their
++        // assistant message together with the matching tool message, emptied
++        // assistant messages are removed, and truncated results keep a head
++        // plus the omission note. `modelMessages` tracks engine state in both
++        // modes; the visible removal only applies in 'model' mode, and both
++        // modes get a synthetic prune marker for the timeline.
++        fold.settle(rec.time);
++        const pruned = applyPruneRecord(
++          modelMessages.map((message) => message.message),
++          rec,
++        );
++        const byIdentity = new Map(modelMessages.map((message) => [message.message, message]));
++        modelMessages = pruned.map((message) => {
++          const previous = byIdentity.get(message);
++          if (previous !== undefined) return previous;
++          return {
++            lineNo: entry.lineNo - 0.001,
++            time: rec.time,
++            source: 'append_message' as const,
++            message: modelFacingMessage(message),
++            toolStepUuids: [],
++          };
++        });
++        resetFold();
++        if (mode === 'model') {
++          messages = [...modelMessages];
++          microCutoff = Math.min(microCutoff, modelMessages.length);
++        }
++        messages.push({
++          lineNo: entry.lineNo,
++          time: rec.time,
++          source: 'prune',
++          // Synthetic marker: never rendered as a bubble (the web dispatches
++          // on `source === 'prune'`). `role: 'assistant'` keeps it out of the
++          // `role: 'tool'` micro-compaction blanking gate.
++          message: { role: 'assistant', content: [], toolCalls: [] } as ContextMessage,
++          toolStepUuids: [],
++          prune: {
++            droppedCalls: rec.dropCalls.length,
++            truncatedResults: rec.truncateResults.length,
++          },
++        });
++        if (typeof rec.tokensAfter === 'number') contextTokens = rec.tokensAfter;
++        break;
++      }
+       case 'context.undo': {
+         // Mirror the engine's `undo`: locate the requested user anchor while
+         // skipping injections, stop at a compaction summary, include an
+diff --git a/apps/vis/server/test/lib/context-projector.test.ts b/apps/vis/server/test/lib/context-projector.test.ts
+index 3bfe8c2d8..2b6a451b7 100644
+--- a/apps/vis/server/test/lib/context-projector.test.ts
++++ b/apps/vis/server/test/lib/context-projector.test.ts
+@@ -129,6 +129,132 @@ describe('context-projector', () => {
+     ]);
+   });
+ 
++  it('projects a context.apply_prune record into a pruned model context and a prune marker', () => {
++    const entries = [
++      {
++        lineNo: 2,
++        data: {
++          type: 'context.append_message' as const,
++          message: {
++            role: 'user' as const,
++            content: [{ type: 'text' as const, text: 'list files' }],
++            toolCalls: [],
++          },
++        },
++        raw: {},
++      },
++      {
++        lineNo: 3,
++        data: {
++          type: 'context.append_loop_event' as const,
++          event: { type: 'step.begin' as const, uuid: 's1', turnId: 't1', step: 0 },
++        },
++        raw: {},
++      },
++      {
++        lineNo: 4,
++        data: {
++          type: 'context.append_loop_event' as const,
++          event: {
++            type: 'tool.call' as const,
++            uuid: 'x1',
++            turnId: 't1',
++            step: 0,
++            stepUuid: 's1',
++            toolCallId: 'call_1',
++            name: 'LS',
++            args: { path: '/' },
++          },
++        },
++        raw: {},
++      },
++      {
++        lineNo: 5,
++        data: {
++          type: 'context.append_loop_event' as const,
++          event: {
++            type: 'tool.call' as const,
++            uuid: 'x2',
++            turnId: 't1',
++            step: 0,
++            stepUuid: 's1',
++            toolCallId: 'call_2',
++            name: 'Read',
++            args: { path: '/a' },
++          },
++        },
++        raw: {},
++      },
++      {
++        lineNo: 6,
++        data: {
++          type: 'context.append_loop_event' as const,
++          event: {
++            type: 'tool.result' as const,
++            parentUuid: 'x1',
++            toolCallId: 'call_1',
++            result: { output: 'file1.txt\nfile2.txt' },
++          },
++        },
++        raw: {},
++      },
++      {
++        lineNo: 7,
++        data: {
++          type: 'context.append_loop_event' as const,
++          event: {
++            type: 'tool.result' as const,
++            parentUuid: 'x2',
++            toolCallId: 'call_2',
++            result: { output: 'x'.repeat(400) },
++          },
++        },
++        raw: {},
++      },
++      {
++        lineNo: 8,
++        data: {
++          type: 'context.apply_prune' as const,
++          agentId: 'main',
++          dropCalls: ['call_1'],
++          truncateResults: [{ toolCallId: 'call_2', headChars: 300 }],
++          trigger: 'manual',
++          tokensBefore: 100,
++          tokensAfter: 40,
++          removedCount: 1,
++        },
++        raw: {},
++      },
++    ];
++
++    const proj = projectContext(entries as any);
++
++    const pruneMarker = proj.messages.find((message) => message.source === 'prune');
++    expect(pruneMarker?.prune).toEqual({ droppedCalls: 1, truncatedResults: 1 });
++    expect(
++      proj.messages.some(
++        (message) =>
++          message.source === 'append_message' &&
++          message.message.role === 'tool' &&
++          message.message.toolCallId === 'call_1',
++      ),
++    ).toBe(false);
++    const assistant = proj.messages.find(
++      (message) => message.source === 'append_message' && message.message.role === 'assistant',
++    );
++    expect(assistant?.message.toolCalls.map((call) => call.id)).toEqual(['call_2']);
++    const keptTool = proj.messages.find(
++      (message) => message.source === 'append_message' && message.message.role === 'tool',
++    );
++    const keptText = keptTool?.message.content[0];
++    expect(keptText?.type).toBe('text');
++    if (keptText?.type === 'text') {
++      expect(
++        keptText.text.endsWith('\n[… 100 chars omitted by prune; re-run the tool if needed …]'),
++      ).toBe(true);
++    }
++  });
++
+   it('drops a vacuous assistant when a step ends without output', () => {
+     const entries = [
+       { lineNo: 1, data: { type: 'context.append_loop_event' as const,
+diff --git a/apps/vis/web/src/components/context/ContextTab.tsx b/apps/vis/web/src/components/context/ContextTab.tsx
+index cb2f72436..29f5dbbd9 100644
+--- a/apps/vis/web/src/components/context/ContextTab.tsx
++++ b/apps/vis/web/src/components/context/ContextTab.tsx
+@@ -5,6 +5,7 @@ import { useSession } from '../../hooks/useSession';
+ import type { TokenUsage } from '../../types';
+ import { Pill } from '../shared/Pill';
+ import { ClearRibbon } from './ClearRibbon';
++import { PruneRibbon } from './PruneRibbon';
+ import { CompactionRibbon } from './CompactionRibbon';
+ import { MessageBubble } from './MessageBubble';
+ import { UndoRibbon } from './UndoRibbon';
+@@ -180,6 +181,9 @@ export function ContextTab({ sessionId, initialAgentId = 'main' }: ContextTabPro
+               if (m.source === 'clear') {
+                 return <ClearRibbon key={m.lineNo} message={m} />;
+               }
++              if (m.source === 'prune') {
++                return <PruneRibbon key={m.lineNo} message={m} />;
++              }
+               return <MessageBubble key={m.lineNo} message={m} />;
+             })
+           )}
+diff --git a/apps/vis/web/src/components/context/PruneRibbon.tsx b/apps/vis/web/src/components/context/PruneRibbon.tsx
+new file mode 100644
+index 000000000..86c766d87
+--- /dev/null
++++ b/apps/vis/web/src/components/context/PruneRibbon.tsx
+@@ -0,0 +1,28 @@
++import type { ProjectedMessage } from '../../types';
++
++interface PruneRibbonProps {
++  /** The synthetic prune-marker message emitted by the projector
++   *  (`source === 'prune'`). */
++  message: ProjectedMessage;
++}
++
++/**
++ * Horizontal ribbon that marks where a `context.apply_prune` record dropped
++ * tool calls and truncated tool results. Styled to match
++ * `CompactionRibbon` / `UndoRibbon` / `ClearRibbon` (flanking `h-px` rules +
++ * a centered mono uppercase label), using the info tone.
++ */
++export function PruneRibbon({ message }: PruneRibbonProps) {
++  const dropped = message.prune?.droppedCalls ?? 0;
++  const truncated = message.prune?.truncatedResults ?? 0;
++  return (
++    <div className="my-3 flex items-center gap-3">
++      <span className="h-px flex-1 bg-[var(--color-sev-info)] opacity-50" />
++      <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-[var(--color-sev-info)]">
++        pruned · {dropped} call{dropped === 1 ? '' : 's'} dropped · {truncated} result
++        {truncated === 1 ? '' : 's'} truncated · line {message.lineNo}
++      </span>
++      <span className="h-px flex-1 bg-[var(--color-sev-info)] opacity-50" />
++    </div>
++  );
++}
+diff --git a/apps/vis/web/src/components/wire/renderers.tsx b/apps/vis/web/src/components/wire/renderers.tsx
+index af3338b94..13d1bc555 100644
+--- a/apps/vis/web/src/components/wire/renderers.tsx
++++ b/apps/vis/web/src/components/wire/renderers.tsx
+@@ -538,6 +538,33 @@ export const WIRE_RENDERERS: RendererMap = {
+     headline: () => ({ main: <Dim>context cleared</Dim> }),
+   },
+ 
++  'context.apply_prune': {
++    tone: 'info',
++    label: 'prune',
++    headline: (r) => {
++      const record = r as unknown as UnknownObject;
++      const dropCalls = Array.isArray(record.dropCalls) ? record.dropCalls.length : 0;
++      const truncateResults = Array.isArray(record.truncateResults)
++        ? record.truncateResults.length
++        : 0;
++      return {
++        main: (
++          <span className="flex items-center gap-2">
++            <Pill tone="info" variant="soft">
++              pruned
++            </Pill>
++            <Dim>
++              {dropCalls} call{dropCalls === 1 ? '' : 's'} dropped · {truncateResults} result
++              {truncateResults === 1 ? '' : 's'} truncated ·{' '}
++              {optionalNumberValue(record.tokensBefore, '?')}→
++              {optionalNumberValue(record.tokensAfter, '?')} tok
++            </Dim>
++          </span>
++        ),
++      };
++    },
++  },
++
+   'context.apply_compaction': {
+     tone: 'compaction',
+     label: 'compacted',
+@@ -557,8 +584,7 @@ export const WIRE_RENDERERS: RendererMap = {
+             </Pill>
+             <Dim>
+               {summary.label} {summary.text.length}b · {optionalNumberValue(record.tokensBefore, '?')}→
+-              {optionalNumberValue(record.tokensAfter, '?')} tok ·{' '}
+-              {compactedCount.value} msgs
++              {optionalNumberValue(record.tokensAfter, '?')} tok ·{' '}              {compactedCount.value} msgs
+             </Dim>
+           </span>
+         ),
+diff --git a/packages/agent-core-v2/docs/wire-manifest.d.ts b/packages/agent-core-v2/docs/wire-manifest.d.ts
+index fcb577ac0..5f2f34ae4 100644
+--- a/packages/agent-core-v2/docs/wire-manifest.d.ts
++++ b/packages/agent-core-v2/docs/wire-manifest.d.ts
+@@ -24,11 +24,12 @@
+ // cross-reducers), blobs (the folding states whose blob codec offloads inline
+ // media to blob storage), owner (the source file declaring the class).
+ 
+-// Index (64 record types)
++// Index (65 record types)
+ //   config.update                      profile                                               src/agent/profile/profileOps.ts
+ //   context.append_loop_event          contextMemory, turn                                   src/agent/contextMemory/contextEvents.ts
+ //   context.append_message             contextMemory, plan, task.notificationDelivery        src/agent/contextMemory/contextEvents.ts
+ //   context.apply_compaction           contextMemory, plan, task.notificationDelivery, turn  src/agent/contextMemory/contextEvents.ts
++//   context.apply_prune                contextMemory                                         src/agent/contextMemory/contextEvents.ts
+ //   context.clear                      contextMemory, plan, task.notificationDelivery, turn  src/agent/contextMemory/contextEvents.ts
+ //   context.undo                       contextMemory, plan, task.notificationDelivery, turn  src/agent/contextMemory/contextEvents.ts
+ //   cron.add                           (none)                                                src/features/cron/cronOps.ts
+@@ -160,6 +161,25 @@ interface ContextAppendMessagePayload {
+  */
+ type ContextApplyCompactionPayload = { _name: 'context.apply_compaction'; } & ({ summary: string, compactedCount: number, contextSummary?: string } | { contextSummary: string, compactedCount: number, summary?: string } | { summary: ContextMessage, count: number, compactedCount?: number });
+ 
++/**
++ * states: contextMemory · blobs: contextMemory
++ * owner: src/agent/contextMemory/contextEvents.ts
++ */
++interface ContextApplyPrunePayload {
++  _name: 'context.apply_prune';
++  agentId: string;
++  dropCalls: string[];
++  truncateResults: {
++    toolCallId: string;
++    headChars: number;
++  }[];
++  trigger: string;
++  tokensBefore?: number;
++  tokensAfter?: number;
++  removedCount: number;
++  note?: string;
++}
++
+ /**
+  * states: contextMemory, plan, task.notificationDelivery, turn · blobs: contextMemory
+  * owner: src/agent/contextMemory/contextEvents.ts
+@@ -963,6 +983,7 @@ interface WirePayloadMap {
+   "context.append_loop_event": ContextAppendLoopEventPayload;
+   "context.append_message": ContextAppendMessagePayload;
+   "context.apply_compaction": ContextApplyCompactionPayload;
++  "context.apply_prune": ContextApplyPrunePayload;
+   "context.clear": ContextClearPayload;
+   "context.undo": ContextUndoPayload;
+   "cron.add": CronAddPayload;
+diff --git a/packages/agent-core-v2/scripts/gen-wire-manifest.mts b/packages/agent-core-v2/scripts/gen-wire-manifest.mts
+index 6abca7411..2d4d58dcf 100644
+--- a/packages/agent-core-v2/scripts/gen-wire-manifest.mts
++++ b/packages/agent-core-v2/scripts/gen-wire-manifest.mts
+@@ -1,5 +1,5 @@
+ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+-import { dirname, join, relative } from 'node:path';
++import { dirname, join, relative, sep } from 'node:path';
+ import { pathToFileURL } from 'node:url';
+ 
+ import { EVENT2_REGISTRY } from '#/app/event/event2';
+@@ -49,7 +49,7 @@ function scanEventDeclarations(): {
+     for (const [i, match] of matches.entries()) {
+       const type = match[1];
+       if (type === undefined) continue;
+-      owners.set(type, relative(PKG, file));
++      owners.set(type, relative(PKG, file).split(sep).join('/'));
+       const windowEnd = i + 1 < matches.length ? matches[i + 1]!.index : source.length;
+       if (DURABLE_DECL_RE.test(source.slice(match.index, windowEnd))) durableTypes.add(type);
+     }
+@@ -329,7 +329,7 @@ function emitTsDict(lines: string[], dict: SketchDict, indent: string): void {
+     lines.push(`${indent}${fieldKey}${optional ? '?' : ''}: ${typeLines[0]}${typeLines.length === 1 ? ';' : ''}`);
+     if (typeLines.length > 1) {
+       lines.push(...typeLines.slice(1, -1));
+-      lines.push(`${typeLines[typeLines.length - 1]};`);
++      lines.push(`${typeLines.at(-1)};`);
+     }
+   }
+ }
+@@ -371,7 +371,7 @@ function renderPayloadDecl(
+       ...header,
+       `type ${name} = { ${nameField} } & (${lines[0]}`,
+       ...lines.slice(1, -1),
+-      `${lines[lines.length - 1]});`,
++      `${lines.at(-1)});`,
+       '',
+     ];
+   }
+@@ -449,7 +449,7 @@ function splitObjectFields(body: string): Map<string, string> {
+   for (const part of splitTopLevel(body)) {
+     const keyMatch = /^([$\w]+|'[^']+'|"[^"]+")\s*:/.exec(part);
+     if (keyMatch?.[1] !== undefined) {
+-      const key = keyMatch[1].replace(/^['"]|['"]$/g, '');
++      const key = keyMatch[1].replaceAll(/^['"]|['"]$/g, '');
+       fields.set(key, part.slice(keyMatch[0].length).trim());
+     } else if (part.startsWith('...')) {
+       fields.set(part, '');
+@@ -551,7 +551,7 @@ function splitTsTypeFields(body: string): Map<string, TsField> {
+   for (const part of splitTopLevel(body, [';', ','])) {
+     const m = /^(?:readonly\s+)?([$\w]+|'[^']+'|"[^"]+")\s*(\?)?\s*:\s*(.+)$/.exec(part);
+     if (m?.[1] !== undefined && m[3] !== undefined) {
+-      fields.set(m[1].replace(/^['"]|['"]$/g, ''), {
++      fields.set(m[1].replaceAll(/^['"]|['"]$/g, ''), {
+         type: m[3].trim(),
+         optional: m[2] !== undefined,
+       });
+@@ -888,7 +888,7 @@ export async function buildWireManifest(): Promise<string> {
+   const { owners, importFiles, durableTypes, classTypes } = scanEventDeclarations();
+   await import('../src/index.ts');
+   for (const file of importFiles) {
+-    await import(relative(join(PKG, 'scripts'), file));
++    await import(pathToFileURL(file).href);
+   }
+   const { WIRE_PROTOCOL_VERSION } = (await import('#/wire/migration/migration')) as {
+     WIRE_PROTOCOL_VERSION: string;
+diff --git a/packages/agent-core-v2/src/agent/contextMemory/contextEvents.ts b/packages/agent-core-v2/src/agent/contextMemory/contextEvents.ts
+index 3300d4ce6..254c14544 100644
+--- a/packages/agent-core-v2/src/agent/contextMemory/contextEvents.ts
++++ b/packages/agent-core-v2/src/agent/contextMemory/contextEvents.ts
+@@ -97,6 +97,30 @@ export class ContextApplyCompaction extends AgentEvent2<ContextApplyCompactionPa
+   static override readonly schema = contextApplyCompactionSchema;
+ }
+ 
++const contextApplyPruneTruncateSchema = z.object({
++  toolCallId: z.string(),
++  headChars: z.number().int().nonnegative(),
++});
++
++const contextApplyPruneSchema = z.object({
++  agentId: z.string(),
++  dropCalls: z.array(z.string()),
++  truncateResults: z.array(contextApplyPruneTruncateSchema),
++  trigger: z.string(),
++  tokensBefore: z.number().optional(),
++  tokensAfter: z.number().optional(),
++  removedCount: z.number().int().nonnegative(),
++  note: z.string().optional(),
++});
++
++export type ContextApplyPrunePayload = z.infer<typeof contextApplyPruneSchema>;
++
++export class ContextApplyPrune extends AgentEvent2<ContextApplyPrunePayload> {
++  static override readonly type = 'context.apply_prune';
++  static override readonly durable = true;
++  static override readonly schema = contextApplyPruneSchema;
++}
++
+ const contextUndoSchema = z.object({
+   agentId: z.string(),
+   count: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+diff --git a/packages/agent-core-v2/src/agent/contextMemory/contextMemory.ts b/packages/agent-core-v2/src/agent/contextMemory/contextMemory.ts
+index 280672524..d5e351f9b 100644
+--- a/packages/agent-core-v2/src/agent/contextMemory/contextMemory.ts
++++ b/packages/agent-core-v2/src/agent/contextMemory/contextMemory.ts
+@@ -2,7 +2,25 @@ import { createDecorator } from "#/_base/di/instantiation";
+ import type { WireLineRange } from '#/wire/record';
+ 
+ import type { LoopRecordedEvent } from './loopEventFold';
+-import type { ContextMessage } from './types';
++import type { ContextMessage, ContextPruneTrigger } from './types';
++
++export interface ContextPruneTruncateInput {
++  readonly toolCallId: string;
++  readonly headChars: number;
++}
++
++export interface ContextPruneInput {
++  readonly dropCalls: readonly string[];
++  readonly truncateResults: readonly ContextPruneTruncateInput[];
++  readonly note?: string;
++  readonly trigger: ContextPruneTrigger;
++}
++
++export interface ContextPruneResult {
++  readonly tokensBefore: number;
++  readonly tokensAfter: number;
++  readonly removedCount: number;
++}
+ 
+ export interface ContextCompactionInput {
+   readonly summary: string;
+@@ -45,6 +63,8 @@ export interface IAgentContextMemoryService {
+   clear(): void;
+ 
+   applyCompaction(input: ContextCompactionInput): ContextCompactionResult;
++
++  applyPrune(input: ContextPruneInput): ContextPruneResult;
+ }
+ 
+ export const IAgentContextMemoryService = createDecorator<IAgentContextMemoryService>('agentContextMemoryService');
+diff --git a/packages/agent-core-v2/src/agent/contextMemory/contextMemoryService.ts b/packages/agent-core-v2/src/agent/contextMemory/contextMemoryService.ts
+index a1f0f6895..bff06b921 100644
+--- a/packages/agent-core-v2/src/agent/contextMemory/contextMemoryService.ts
++++ b/packages/agent-core-v2/src/agent/contextMemory/contextMemoryService.ts
+@@ -10,17 +10,20 @@ import {
+   IAgentContextMemoryService,
+   type ContextCompactionInput,
+   type ContextCompactionResult,
++  type ContextPruneInput,
++  type ContextPruneResult,
+ } from './contextMemory';
+ import { buildContextCompactionShape, type TokenEstimate } from './compactionHandoff';
+ import {
+   ContextApplyCompaction,
++  ContextApplyPrune,
+   ContextAppendLoopEvent,
+   ContextAppendMessage,
+   ContextClear,
+   ContextSpliced,
+   type ContextSplicedPayload,
+ } from './contextEvents';
+-import { contextMemoryKey } from './contextOps';
++import { applyPruneRecord, contextMemoryKey } from './contextOps';
+ import type { LoopRecordedEvent } from './loopEventFold';
+ import type { ContextMessage } from './types';
+ 
+@@ -133,6 +136,41 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
+     return publicResult;
+   }
+ 
++  applyPrune(input: ContextPruneInput): ContextPruneResult {
++    const history = this.get();
++    const tokensBefore = this.tokenCounting.estimateMessages(history);
++    const messages = applyPruneRecord(history, input);
++    const tokensAfter = this.tokenCounting.estimateMessages(messages);
++    const removedCount = history.length - messages.length;
++    void this.dispatcher.dispatch(
++      new ContextApplyPrune({
++        agentId: this.scopeContext.agentId,
++        dropCalls: [...input.dropCalls],
++        truncateResults: input.truncateResults.map((truncate) => ({
++          toolCallId: truncate.toolCallId,
++          headChars: truncate.headChars,
++        })),
++        trigger: input.trigger,
++        tokensBefore,
++        tokensAfter,
++        removedCount,
++        note: input.note,
++      }),
++    );
++    this.tokenCounting.rebase(this.scopeContext.agentContext, {
++      length: messages.length,
++      tokens: tokensAfter,
++      measured: false,
++    });
++    this.publishSplice({
++      start: 0,
++      deleteCount: history.length,
++      messages: [...messages],
++      tokens: tokensAfter,
++    });
++    return { tokensBefore, tokensAfter, removedCount };
++  }
++
+   private publishSplice(input: Omit<ContextSplicedPayload, 'agentId'>): void {
+     if (input.deleteCount > 0) this.revision += 1;
+     void this.dispatcher.dispatch(
+diff --git a/packages/agent-core-v2/src/agent/contextMemory/contextOps.ts b/packages/agent-core-v2/src/agent/contextMemory/contextOps.ts
+index f9c085057..7fbd7d04e 100644
+--- a/packages/agent-core-v2/src/agent/contextMemory/contextOps.ts
++++ b/packages/agent-core-v2/src/agent/contextMemory/contextOps.ts
+@@ -15,6 +15,7 @@ import {
+   ContextAppendLoopEvent,
+   ContextAppendMessage,
+   ContextApplyCompaction,
++  ContextApplyPrune,
+   ContextClear,
+   type ContextApplyCompactionPayload,
+ } from './contextEvents';
+@@ -104,7 +105,8 @@ export const contextMemoryKey = defineState('contextMemory', (): ContextMessage[
+       readContextCompactionShapeInput(e as unknown as ContextApplyCompactionPayload),
+     );
+     return resetFold([...result.messages]) as ContextMessage[];
+-  });
++  })
++  .on(ContextApplyPrune, (s, e) => applyPruneRecord(s, e as unknown as PruneRecordShape) as ContextMessage[]);
+ 
+ export function popSwarmModeReminder(state: ContextMessage[]): ContextMessage[] {
+   const last = state.at(-1);
+@@ -126,6 +128,88 @@ export function applyContextCompactionRecord(
+   return resetFold([...result.messages]) as ContextMessage[];
+ }
+ 
++export interface PruneRecordShape {
++  readonly dropCalls?: readonly string[];
++  readonly truncateResults?: readonly {
++    readonly toolCallId: string;
++    readonly headChars: number;
++  }[];
++}
++
++export function applyPruneRecord(
++  state: readonly ContextMessage[],
++  record: PruneRecordShape,
++): ContextMessage[] {
++  const dropCalls = record.dropCalls ?? [];
++  const truncateResults = record.truncateResults ?? [];
++  if (dropCalls.length === 0 && truncateResults.length === 0) return [...state];
++
++  const callIds = new Set<string>();
++  for (const message of state) {
++    if (message.role !== 'assistant') continue;
++    for (const call of message.toolCalls) {
++      callIds.add(call.id);
++    }
++  }
++  for (const id of dropCalls) {
++    if (!callIds.has(id)) {
++      throw new Error2(
++        ErrorCodes.STORAGE_DECODE_FAILED,
++        `Invalid context.apply_prune record: unknown tool call id "${id}"`,
++      );
++    }
++  }
++  const truncateById = new Map<string, number>();
++  for (const truncate of truncateResults) {
++    if (!callIds.has(truncate.toolCallId)) {
++      throw new Error2(
++        ErrorCodes.STORAGE_DECODE_FAILED,
++        `Invalid context.apply_prune record: unknown tool call id "${truncate.toolCallId}"`,
++      );
++    }
++    truncateById.set(truncate.toolCallId, truncate.headChars);
++  }
++
++  const dropSet = new Set(dropCalls);
++  const result: ContextMessage[] = [];
++  for (const message of state) {
++    if (message.role === 'tool' && message.toolCallId !== undefined) {
++      if (dropSet.has(message.toolCallId)) continue;
++      const headChars = truncateById.get(message.toolCallId);
++      if (headChars !== undefined) {
++        const text = textOf(message);
++        if (text.length > headChars) {
++          const omitted = text.length - headChars;
++          result.push({
++            ...message,
++            content: [
++              {
++                type: 'text',
++                text: `${text.slice(0, headChars)}\n[… ${String(omitted)} chars omitted by prune; re-run the tool if needed …]`,
++              },
++            ],
++          });
++          continue;
++        }
++      }
++      result.push(message);
++      continue;
++    }
++    if (message.role === 'assistant') {
++      const keptCalls = message.toolCalls.filter((call) => !dropSet.has(call.id));
++      if (keptCalls.length === message.toolCalls.length) {
++        result.push(message);
++        continue;
++      }
++      if (keptCalls.length === 0 && textOf(message).length === 0) continue;
++      result.push({ ...message, toolCalls: keptCalls });
++      continue;
++    }
++    result.push(message);
++  }
++  return result;
++}
++
+ export function readContextCompactionShapeInput(
+   record: ContextCompactionRecord,
+ ): ContextCompactionShapeInput {
+diff --git a/packages/agent-core-v2/src/agent/contextMemory/contextTranscript.ts b/packages/agent-core-v2/src/agent/contextMemory/contextTranscript.ts
+index db75f8055..81d4122f7 100644
+--- a/packages/agent-core-v2/src/agent/contextMemory/contextTranscript.ts
++++ b/packages/agent-core-v2/src/agent/contextMemory/contextTranscript.ts
+@@ -9,6 +9,7 @@ import {
+ } from './compactionHandoff';
+ import { isPromptOwnedInjection, isUndoAnchor } from './conversationTime';
+ import { createLoopEventFold, type LoopRecordedEvent } from './loopEventFold';
++import { applyPruneRecord, type PruneRecordShape } from './contextOps';
+ import type { ContextMessage, ContextMessageTiming } from './types';
+ 
+ export interface ContextTranscript {
+@@ -152,6 +153,26 @@ export function createContextTranscriptReducer(): ContextTranscriptReducer {
+       case 'context.undo':
+         applyUndo(record['count'] as number);
+         break;
++      case 'context.apply_prune': {
++        fold.settle(record.time);
++        const pruned = applyPruneRecord(
++          transcript.map((entry) => entry.message as ContextMessage),
++          readPruneRecordShape(record),
++        );
++        const byIdentity = new Map(transcript.map((entry) => [entry.message, entry]));
++        transcript.length = 0;
++        foldedLength = 0;
++        for (const message of pruned) {
++          const previous = byIdentity.get(message as MutableMessage);
++          push(
++            previous !== undefined
++              ? previous
++              : { message: message as MutableMessage, time: record.time },
++          );
++        }
++        resetOpenState();
++        break;
++      }
+       case 'context.clear':
+         clearFloor = transcript.length;
+         foldedLength = 0;
+@@ -238,3 +259,23 @@ function readNumber(record: WireRecord, key: string): number | undefined {
+   const value = record[key];
+   return typeof value === 'number' ? value : undefined;
+ }
++
++function readPruneRecordShape(record: WireRecord): PruneRecordShape {
++  const rawDrops = record['dropCalls'];
++  const rawTruncates = record['truncateResults'];
++  const dropCalls = Array.isArray(rawDrops)
++    ? rawDrops.filter((id): id is string => typeof id === 'string')
++    : [];
++  const truncateResults = Array.isArray(rawTruncates)
++    ? rawTruncates
++        .filter(
++          (entry): entry is { readonly toolCallId: string; readonly headChars: number } =>
++            typeof entry === 'object' &&
++            entry !== null &&
++            typeof (entry as { readonly toolCallId?: unknown }).toolCallId === 'string' &&
++            typeof (entry as { readonly headChars?: unknown }).headChars === 'number',
++        )
++        .map((entry) => ({ toolCallId: entry.toolCallId, headChars: entry.headChars }))
++    : [];
++  return { dropCalls, truncateResults };
++}
+diff --git a/packages/agent-core-v2/src/agent/contextMemory/types.ts b/packages/agent-core-v2/src/agent/contextMemory/types.ts
+index 164e8b187..bfa6d73e3 100644
+--- a/packages/agent-core-v2/src/agent/contextMemory/types.ts
++++ b/packages/agent-core-v2/src/agent/contextMemory/types.ts
+@@ -156,3 +156,5 @@ export interface AgentContextData {
+   history: readonly ContextMessage[];
+   tokenCount: number;
+ }
++
++export type ContextPruneTrigger = 'manual' | 'auto';
+diff --git a/packages/agent-core-v2/src/agent/replayBuilder/fold.ts b/packages/agent-core-v2/src/agent/replayBuilder/fold.ts
+index 759081b28..23eb6a2c1 100644
+--- a/packages/agent-core-v2/src/agent/replayBuilder/fold.ts
++++ b/packages/agent-core-v2/src/agent/replayBuilder/fold.ts
+@@ -1,5 +1,6 @@
+ import type { LoopRecordedEvent } from '#/agent/contextMemory/loopEventFold';
+ import type { ContextMessage } from '#/agent/contextMemory/types';
++import { applyPruneRecord, type PruneRecordShape } from '#/agent/contextMemory/contextOps';
+ import type { CompactionResult } from '#/agent/fullCompaction/types';
+ import type { PermissionApprovalResultRecord } from '#/agent/permissionRules/permissionRules';
+ import type { PermissionMode } from '#/agent/permissionPolicy/types';
+@@ -35,6 +36,7 @@ export const FOLD_RELEVANT_WIRE_TYPES: ReadonlySet<string> = new Set([
+   'context.undo',
+   'context.clear',
+   'context.apply_compaction',
++  'context.apply_prune',
+   'full_compaction.begin',
+   'full_compaction.cancel',
+   'goal.create',
+@@ -135,6 +137,9 @@ class WireReplayFoldState {
+       case 'context.apply_compaction':
+         this.applyCompaction(record);
+         return;
++      case 'context.apply_prune':
++        this.applyPrune(record);
++        return;
+       case 'full_compaction.begin':
+         this.push(
+           { type: 'compaction', instruction: readString(record, 'instruction') },
+@@ -367,6 +372,13 @@ class WireReplayFoldState {
+     }
+   }
+ 
++  private applyPrune(record: WireRecord): void {
++    this.history = applyPruneRecord(this.history, readPruneShape(record)) as ContextMessage[];
++    this.openSteps.clear();
++    this.pendingToolResultIds.clear();
++    this.deferredMessages = [];
++  }
++
+   private selectLegacyKeptTail(record: WireRecord): ContextMessage[] {
+     if (
+       readNumber(record, 'tokensAfter') !== undefined &&
+@@ -548,6 +560,26 @@ function readNumber(record: WireRecord, key: string): number | undefined {
+   return typeof value === 'number' ? value : undefined;
+ }
+ 
++function readPruneShape(record: WireRecord): PruneRecordShape {
++  const rawDrops = record['dropCalls'];
++  const rawTruncates = record['truncateResults'];
++  const dropCalls = Array.isArray(rawDrops)
++    ? rawDrops.filter((id): id is string => typeof id === 'string')
++    : [];
++  const truncateResults = Array.isArray(rawTruncates)
++    ? rawTruncates
++        .filter(
++          (entry): entry is { readonly toolCallId: string; readonly headChars: number } =>
++            typeof entry === 'object' &&
++            entry !== null &&
++            typeof (entry as { readonly toolCallId?: unknown }).toolCallId === 'string' &&
++            typeof (entry as { readonly headChars?: unknown }).headChars === 'number',
++        )
++        .map((entry) => ({ toolCallId: entry.toolCallId, headChars: entry.headChars }))
++    : [];
++  return { dropCalls, truncateResults };
++}
++
+ function readCompactionSummary(record: WireRecord): string {
+   const summary = record['summary'];
+   if (typeof summary === 'string') return summary;
+diff --git a/packages/agent-core-v2/src/human/persist/v2/fold.ts b/packages/agent-core-v2/src/human/persist/v2/fold.ts
+index e04251cfb..ba46a79f0 100644
+--- a/packages/agent-core-v2/src/human/persist/v2/fold.ts
++++ b/packages/agent-core-v2/src/human/persist/v2/fold.ts
+@@ -188,9 +188,9 @@ function truncateTextToTokensFromEnd(text: string, maxTokens: number): string {
+   let start = text.length;
+   for (let i = text.length - 1; i >= 0; i--) {
+     let isAscii = false;
+-    const code = text.charCodeAt(i);
++    const code = text.codePointAt(i);
+     if (code >= 0xdc00 && code <= 0xdfff && i > 0) {
+-      const high = text.charCodeAt(i - 1);
++      const high = text.codePointAt(i - 1);
+       if (high >= 0xd800 && high <= 0xdbff) {
+         i--;
+       }
+@@ -212,6 +212,66 @@ function replaceMessageText(message: V2ContextMessage, text: string): V2ContextM
+   return { ...message, content: [{ type: 'text', text }], toolCalls: [] };
+ }
+ 
++function applyPruneToMessages(
++  messages: readonly V2ContextMessage[],
++  record: V2WireRecord,
++): V2ContextMessage[] {
++  const rawDrops = record['dropCalls'];
++  const rawTruncates = record['truncateResults'];
++  const dropCalls = Array.isArray(rawDrops)
++    ? rawDrops.filter((id): id is string => typeof id === 'string')
++    : [];
++  const truncateResults = Array.isArray(rawTruncates)
++    ? rawTruncates.filter(
++        (entry): entry is { readonly toolCallId: string; readonly headChars: number } =>
++          typeof entry === 'object' &&
++          entry !== null &&
++          typeof (entry as { readonly toolCallId?: unknown }).toolCallId === 'string' &&
++          typeof (entry as { readonly headChars?: unknown }).headChars === 'number',
++      )
++    : [];
++  if (dropCalls.length === 0 && truncateResults.length === 0) return [...messages];
++  const dropSet = new Set(dropCalls);
++  const truncateById = new Map(truncateResults.map((entry) => [entry.toolCallId, entry.headChars]));
++  const result: V2ContextMessage[] = [];
++  for (const message of messages) {
++    if (message.role === 'tool' && message.toolCallId !== undefined) {
++      if (dropSet.has(message.toolCallId)) continue;
++      const headChars = truncateById.get(message.toolCallId);
++      if (headChars !== undefined) {
++        const text = extractText(message.content);
++        if (text.length > headChars) {
++          const omitted = text.length - headChars;
++          result.push({
++            ...message,
++            content: [
++              {
++                type: 'text',
++                text: `${text.slice(0, headChars)}\n[… ${String(omitted)} chars omitted by prune; re-run the tool if needed …]`,
++              },
++            ],
++          });
++          continue;
++        }
++      }
++      result.push(message);
++      continue;
++    }
++    if (message.role === 'assistant') {
++      const keptCalls = (message.toolCalls ?? []).filter((call) => !dropSet.has(call.id));
++      if (keptCalls.length === (message.toolCalls ?? []).length) {
++        result.push(message);
++        continue;
++      }
++      if (keptCalls.length === 0 && extractText(message.content).length === 0) continue;
++      result.push({ ...message, toolCalls: keptCalls });
++      continue;
++    }
++    result.push(message);
++  }
++  return result;
++}
++
+ function wrapSystemReminder(content: string): string {
+   return `<system-reminder>\n${content.trim()}\n</system-reminder>`;
+ }
+@@ -613,6 +673,13 @@ export function foldV2WireRecords(records: readonly V2WireRecord[]): FoldedV2Age
+         resetFold();
+         break;
+       }
++      case 'context.apply_prune': {
++        const pruned = applyPruneToMessages(messages, record);
++        messages.length = 0;
++        messages.push(...pruned);
++        resetFold();
++        break;
++      }
+       case 'turn.prompt': {
+         advanceTurnClock(nextTurnId + 1);
+         break;
+diff --git a/packages/agent-core-v2/src/human/persist/v2/wire.ts b/packages/agent-core-v2/src/human/persist/v2/wire.ts
+index 19015e384..614a46b92 100644
+--- a/packages/agent-core-v2/src/human/persist/v2/wire.ts
++++ b/packages/agent-core-v2/src/human/persist/v2/wire.ts
+@@ -23,6 +23,7 @@ const CONSUMED_TYPES = new Set([
+   'context.append_message',
+   'context.append_loop_event',
+   'context.apply_compaction',
++  'context.apply_prune',
+   'context.clear',
+   'context.undo',
+   'turn.prompt',
+@@ -83,6 +84,22 @@ function passesValidation(record: V2WireRecord): boolean {
+     }
+     case 'context.apply_compaction':
+       return isValidCompactionRecord(record);
++    case 'context.apply_prune': {
++      const dropCalls = record['dropCalls'];
++      const truncateResults = record['truncateResults'];
++      if (dropCalls !== undefined && !Array.isArray(dropCalls)) return false;
++      if (truncateResults === undefined) return true;
++      if (!Array.isArray(truncateResults)) return false;
++      return truncateResults.every(
++        (entry) =>
++          typeof entry === 'object' &&
++          entry !== null &&
++          typeof (entry as { readonly toolCallId?: unknown }).toolCallId === 'string' &&
++          typeof (entry as { readonly headChars?: unknown }).headChars === 'number' &&
++          Number.isInteger((entry as { readonly headChars?: unknown }).headChars) &&
++          ((entry as { readonly headChars?: unknown }).headChars as number) >= 0,
++      );
++    }
+     case 'turn.prompt': {
+       const promptId = record['promptId'];
+       return promptId === undefined || typeof promptId === 'string';
+diff --git a/packages/agent-core-v2/test/agent/contextMemory/pruneRecord.test.ts b/packages/agent-core-v2/test/agent/contextMemory/pruneRecord.test.ts
+new file mode 100644
+index 000000000..02f6b4656
+--- /dev/null
++++ b/packages/agent-core-v2/test/agent/contextMemory/pruneRecord.test.ts
+@@ -0,0 +1,132 @@
++import { describe, expect, it } from 'vitest';
++
++import { applyPruneRecord } from '#/agent/contextMemory/contextOps';
++import type { ContextMessage } from '#/agent/contextMemory/types';
++
++function userMessage(text: string): ContextMessage {
++  return { role: 'user', content: [{ type: 'text', text }], toolCalls: [] };
++}
++
++function assistantMessage(
++  text: string,
++  ...calls: readonly { id: string; arguments: string }[]
++): ContextMessage {
++  return {
++    role: 'assistant',
++    content: text.length === 0 ? [] : [{ type: 'text', text }],
++    toolCalls: calls.map((call) => ({ type: 'function', id: call.id, name: 'Read', arguments: call.arguments })),
++  };
++}
++
++function toolMessage(toolCallId: string, text: string): ContextMessage {
++  return { role: 'tool', content: [{ type: 'text', text }], toolCalls: [], toolCallId };
++}
++
++function history(): ContextMessage[] {
++  return [
++    userMessage('read a and b'),
++    assistantMessage('reading', { id: 'c1', arguments: '{"path":"a"}' }, { id: 'c2', arguments: '{"path":"b"}' }),
++    toolMessage('c1', 'contents a'),
++    toolMessage('c2', 'contents b'),
++  ];
++}
++
++function orphanCheck(messages: readonly ContextMessage[]): void {
++  const callIds = new Set<string>();
++  for (const message of messages) {
++    if (message.role !== 'assistant') continue;
++    for (const call of message.toolCalls) callIds.add(call.id);
++  }
++  for (const message of messages) {
++    if (message.role === 'tool') expect(callIds.has(message.toolCallId ?? '')).toBe(true);
++  }
++}
++
++describe('applyPruneRecord', () => {
++  it('drops one of two calls and its tool message', () => {
++    const pruned = applyPruneRecord(history(), { dropCalls: ['c1'], truncateResults: [] });
++
++    expect(pruned.map((message) => message.role)).toEqual(['user', 'assistant', 'tool']);
++    expect(pruned[1]?.toolCalls.map((call) => call.id)).toEqual(['c2']);
++    expect(pruned.some((message) => message.role === 'tool' && message.toolCallId === 'c1')).toBe(false);
++    orphanCheck(pruned);
++  });
++
++  it('drops the only call of a text-less assistant message and removes the message', () => {
++    const state = [
++      userMessage('run it'),
++      assistantMessage('', { id: 'c1', arguments: '{}' }),
++      toolMessage('c1', 'output'),
++    ];
++
++    const pruned = applyPruneRecord(state, { dropCalls: ['c1'], truncateResults: [] });
++
++    expect(pruned.map((message) => message.role)).toEqual(['user']);
++    orphanCheck(pruned);
++  });
++
++  it('keeps an assistant message with text when its only call is dropped', () => {
++    const state = [
++      userMessage('run it'),
++      assistantMessage('here is the answer', { id: 'c1', arguments: '{}' }),
++      toolMessage('c1', 'output'),
++    ];
++
++    const pruned = applyPruneRecord(state, { dropCalls: ['c1'], truncateResults: [] });
++
++    expect(pruned.map((message) => message.role)).toEqual(['user', 'assistant']);
++    expect(pruned[1]?.toolCalls).toEqual([]);
++    expect(pruned[1]?.content).toEqual([{ type: 'text', text: 'here is the answer' }]);
++    orphanCheck(pruned);
++  });
++
++  it('truncates a result to headChars plus the omission note', () => {
++    const text = 'x'.repeat(5000);
++    const state = [assistantMessage('', { id: 'c1', arguments: '{}' }), toolMessage('c1', text)];
++
++    const pruned = applyPruneRecord(state, {
++      dropCalls: [],
++      truncateResults: [{ toolCallId: 'c1', headChars: 300 }],
++    });
++
++    const truncated = pruned[1]?.content[0];
++    expect(truncated?.type).toBe('text');
++    if (truncated?.type === 'text') {
++      expect(truncated.text).toBe(
++        `${'x'.repeat(300)}\n[… 4700 chars omitted by prune; re-run the tool if needed …]`,
++      );
++    }
++    orphanCheck(pruned);
++  });
++
++  it('leaves a result shorter than headChars untouched', () => {
++    const state = [assistantMessage('', { id: 'c1', arguments: '{}' }), toolMessage('c1', 'short')];
++
++    const pruned = applyPruneRecord(state, {
++      dropCalls: [],
++      truncateResults: [{ toolCallId: 'c1', headChars: 300 }],
++    });
++
++    expect(pruned[1]?.content).toEqual([{ type: 'text', text: 'short' }]);
++  });
++
++  it('throws on an unknown id and leaves nothing applied', () => {
++    const state = history();
++
++    expect(() => applyPruneRecord(state, { dropCalls: ['missing'], truncateResults: [] })).toThrow(
++      /unknown tool call id/,
++    );
++    expect(() =>
++      applyPruneRecord(state, { dropCalls: [], truncateResults: [{ toolCallId: 'missing', headChars: 10 }] }),
++    ).toThrow(/unknown tool call id/);
++    expect(state).toHaveLength(4);
++  });
++
++  it('returns a copy for an empty prune', () => {
++    const state = history();
++    const pruned = applyPruneRecord(state, { dropCalls: [], truncateResults: [] });
++
++    expect(pruned).toEqual(state);
++    expect(pruned).not.toBe(state);
++  });
++});
+diff --git a/packages/agent-core-v2/test/agent/contextMemory/splice-replay.test.ts b/packages/agent-core-v2/test/agent/contextMemory/splice-replay.test.ts
+index ad2988e4b..46002b020 100644
+--- a/packages/agent-core-v2/test/agent/contextMemory/splice-replay.test.ts
++++ b/packages/agent-core-v2/test/agent/contextMemory/splice-replay.test.ts
+@@ -168,13 +168,13 @@ const noopTokenCounting: ISessionTokenCountingService = {
+   estimateTools: () => 0,
+ };
+ 
+-function buildHost(key: string): Host {
++function buildHost(key: string, tokenCounting: ISessionTokenCountingService = noopTokenCounting): Host {
+   const ix = disposables.add(new TestInstantiationService());
+   ix.stub(IFileSystemStorageService, new InMemoryStorageService());
+   ix.set(IAppendLogStore, new SyncDescriptor(AppendLogStore));
+   ix.stub(IAgentBlobService, blob);
+   ix.set(IEventBus, new SyncDescriptor(EventBusService));
+-  ix.set(ISessionTokenCountingService, noopTokenCounting);
++  ix.set(ISessionTokenCountingService, tokenCounting);
+   ix.set(IAgentContextMemoryService, new SyncDescriptor(AgentContextMemoryService));
+   const wire = registerTestAgentWire(ix, testWireScope(SCOPE, key), {
+     log: ix.get(IAppendLogStore),
+@@ -579,3 +579,100 @@ describe('AgentContextMemoryService (wire-backed)', () => {
+   });
+ 
+ });
++
++describe('AgentContextMemoryService applyPrune', () => {
++  function exchangeHistory(): ContextMessage[] {
++    return [
++      userMessage('read a and b'),
++      {
++        role: 'assistant',
++        content: [{ type: 'text', text: 'reading' }],
++        toolCalls: [
++          { type: 'function', id: 'c1', name: 'Read', arguments: '{"path":"a"}' },
++          { type: 'function', id: 'c2', name: 'Read', arguments: '{"path":"b"}' },
++        ],
++      },
++      { role: 'tool', content: [{ type: 'text', text: 'contents a' }], toolCalls: [], toolCallId: 'c1' },
++      {
++        role: 'tool',
++        content: [{ type: 'text', text: 'contents b are quite long' }],
++        toolCalls: [],
++        toolCallId: 'c2',
++      },
++    ];
++  }
++
++  it('prunes the live state, writes a durable record, and rebases the token count', async () => {
++    const rebases: { length: number; tokens: number }[] = [];
++    const counting: ISessionTokenCountingService = {
++      ...noopTokenCounting,
++      estimateMessage: () => 10,
++      estimateMessages: (messages) => messages.length * 10,
++      rebase: (_context, input) => {
++        rebases.push({ length: input.length, tokens: input.tokens });
++      },
++    };
++    const host = buildHost('ctx-prune', counting);
++    host.svc.append(...exchangeHistory());
++
++    const result = host.svc.applyPrune({
++      dropCalls: ['c1'],
++      truncateResults: [{ toolCallId: 'c2', headChars: 10 }],
++      trigger: 'manual',
++      note: 'kept 3/4',
++    });
++
++    expect(result).toEqual({ tokensBefore: 40, tokensAfter: 30, removedCount: 1 });
++    expect(rebases.at(-1)).toEqual({ length: 3, tokens: 30 });
++    expect(host.svc.prefixRevision()).toBe(1);
++
++    const history = host.svc.get();
++    expect(history.map((message) => message.role)).toEqual(['user', 'assistant', 'tool']);
++    expect(history[1]?.toolCalls.map((call) => call.id)).toEqual(['c2']);
++    expect(textOf(history[2]!)).toBe(
++      'contents b\n[… 15 chars omitted by prune; re-run the tool if needed …]',
++    );
++
++    await host.dispatcher.flush();
++    const records = await readRecords(host.log, 'ctx-prune');
++    expect(records.map((record) => record.type)).toContain('context.apply_prune');
++    expect(records.at(-1)).toEqual(
++      expect.objectContaining({
++        type: 'context.apply_prune',
++        dropCalls: ['c1'],
++        truncateResults: [{ toolCallId: 'c2', headChars: 10 }],
++        trigger: 'manual',
++        tokensBefore: 40,
++        tokensAfter: 30,
++        removedCount: 1,
++        note: 'kept 3/4',
++      }),
++    );
++  });
++
++  it('replays a pruned wire to the same messages the live service produced', async () => {
++    const live = buildHost('ctx-prune-live');
++    live.svc.append(...exchangeHistory());
++    live.svc.applyPrune({
++      dropCalls: ['c1'],
++      truncateResults: [{ toolCallId: 'c2', headChars: 10 }],
++      trigger: 'auto',
++    });
++    await live.dispatcher.flush();
++    const records = await readRecords(live.log, 'ctx-prune-live');
++
++    const replay = buildHost('ctx-prune-replay');
++    await restoreTestEventDispatcher(
++      replay.dispatcher,
++      replay.log,
++      testWireScope(SCOPE, 'ctx-prune-replay'),
++      records,
++    );
++
++    const liveHistory = live.svc.get();
++    const replayed = replay.agentState.get(contextMemoryKey);
++    expect(replayed.map((message) => message.role)).toEqual(liveHistory.map((message) => message.role));
++    expect(replayed.map(textOf)).toEqual(liveHistory.map((message) => textOf(message as never)));
++    expect(replayed[1]?.toolCalls.map((call) => call.id)).toEqual(['c2']);
++  });
++});
+diff --git a/packages/agent-core-v2/test/agent/contextMemory/stubs.ts b/packages/agent-core-v2/test/agent/contextMemory/stubs.ts
+index 805729c23..e2cfaabe8 100644
+--- a/packages/agent-core-v2/test/agent/contextMemory/stubs.ts
++++ b/packages/agent-core-v2/test/agent/contextMemory/stubs.ts
+@@ -4,8 +4,10 @@ import {
+   IAgentContextMemoryService,
+   type ContextCompactionInput,
+   type ContextCompactionResult,
++  type ContextPruneInput,
++  type ContextPruneResult,
+ } from '#/agent/contextMemory/contextMemory';
+-import { computeUndoCut, type UndoCut } from '#/agent/contextMemory/contextOps';
++import { applyPruneRecord, computeUndoCut, type UndoCut } from '#/agent/contextMemory/contextOps';
+ import { ContextSpliced } from '#/agent/contextMemory/contextEvents';
+ import type { LoopRecordedEvent } from '#/agent/contextMemory/loopEventFold';
+ import type { ContextMessage } from '#/agent/contextMemory/types';
+@@ -90,6 +92,15 @@ export function stubContextMemory(eventBus?: IEventBus): StubContextMemory {
+       void _messages;
+       return result;
+     },
++    applyPrune: (input: ContextPruneInput): ContextPruneResult => {
++      const pruned = applyPruneRecord(messages, input);
++      const previousLength = messages.length;
++      const removedCount = previousLength - pruned.length;
++      messages.splice(0, previousLength, ...pruned);
++      if (previousLength > 0) revision += 1;
++      publishSplice(eventBus, { start: 0, deleteCount: previousLength, messages: [...pruned] });
++      return { tokensBefore: 0, tokensAfter: 0, removedCount };
++    },
+   };
+ }
+ 
+@@ -120,6 +131,9 @@ class StubContextMemoryService implements IAgentContextMemoryService {
+   applyCompaction(input: ContextCompactionInput): ContextCompactionResult {
+     return this.impl.applyCompaction(input);
+   }
++  applyPrune(input: ContextPruneInput): ContextPruneResult {
++    return this.impl.applyPrune(input);
++  }
+   prefixRevision(): number {
+     return this.impl.prefixRevision();
+   }
+diff --git a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
+index e6aca0757..cda0967c4 100644
+--- a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
++++ b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
+@@ -309,6 +309,10 @@ class FakeContextMemory implements IAgentContextMemoryService {
+     throw new Error('unused in this suite');
+   }
+ 
++  applyPrune(): never {
++    throw new Error('unused in this suite');
++  }
++
+   landAppended(): void {
+     this.history.push(...this.appended);
+     this.appended.length = 0;
+diff --git a/packages/agent-core-v2/test/agent/undo/undo.test.ts b/packages/agent-core-v2/test/agent/undo/undo.test.ts
+index ded0f07cb..73647c765 100644
+--- a/packages/agent-core-v2/test/agent/undo/undo.test.ts
++++ b/packages/agent-core-v2/test/agent/undo/undo.test.ts
+@@ -209,6 +209,26 @@ describe('AgentConversationUndoService', () => {
+     }
+   });
+ 
++  it('undoes across a prune without treating it as a boundary', async () => {
++    await setup();
++    const undo = ctx.get(IAgentConversationUndoService);
++    ctx.appendTurnExchange('first', 'answer one');
++    ctx.appendTurnExchange('second', 'answer two');
++    ctx.context.append(
++      {
++        role: 'assistant',
++        content: [],
++        toolCalls: [{ type: 'function', id: 'c1', name: 'Read', arguments: '{}' }],
++      },
++      { role: 'tool', content: [{ type: 'text', text: 'result' }], toolCalls: [], toolCallId: 'c1' },
++    );
++    ctx.context.applyPrune({ dropCalls: ['c1'], truncateResults: [], trigger: 'auto' });
++
++    expect(undo.availability()).toEqual({ maxTurns: 2, stoppedAtCompaction: false });
++    await undo.undo(2);
++    expect(ctx.context.get()).toHaveLength(0);
++  });
++
+   it('refuses to cross a compaction boundary', async () => {
+     await setup();
+     const undo = ctx.get(IAgentConversationUndoService);
+diff --git a/packages/agent-core-v2/test/features/externalHooks/integration.test.ts b/packages/agent-core-v2/test/features/externalHooks/integration.test.ts
+index 977caf5c8..005451856 100644
+--- a/packages/agent-core-v2/test/features/externalHooks/integration.test.ts
++++ b/packages/agent-core-v2/test/features/externalHooks/integration.test.ts
+@@ -19,7 +19,10 @@ import {
+   IAgentContextMemoryService,
+   type ContextCompactionInput,
+   type ContextCompactionResult,
++  type ContextPruneInput,
++  type ContextPruneResult,
+ } from '#/agent/contextMemory/contextMemory';
++import { applyPruneRecord } from '#/agent/contextMemory/contextOps';
+ import type { ContextMessage } from '#/agent/contextMemory/types';
+ import {
+   HookDefSchema,
+@@ -139,6 +142,12 @@ function stubContextMemory(): IAgentContextMemoryService & {
+       void _messages;
+       return result;
+     },
++    applyPrune: (input: ContextPruneInput): ContextPruneResult => {
++      const pruned = applyPruneRecord(messages, input);
++      const removedCount = messages.length - pruned.length;
++      messages.splice(0, messages.length, ...pruned);
++      return { tokensBefore: 0, tokensAfter: 0, removedCount };
++    },
+     messages,
+   };
+ }
+@@ -1616,7 +1625,7 @@ describe('PreCompact prune contract', () => {
+       await harness.ix.get(IAgentFullCompactionService).hooks.onWillCompact.run(task);
+ 
+       const inputData = harness.triggerCalls[0]?.inputData ?? {};
+-      expect(inputData.instruction).toBeUndefined();
++      expect(inputData['instruction']).toBeUndefined();
+     } finally {
+       harness.ix.dispose();
+       disposables.dispose();
+diff --git a/packages/agent-core-v2/test/wire/resume.test.ts b/packages/agent-core-v2/test/wire/resume.test.ts
+index b92fbf53d..f7b178da0 100644
+--- a/packages/agent-core-v2/test/wire/resume.test.ts
++++ b/packages/agent-core-v2/test/wire/resume.test.ts
+@@ -64,6 +64,73 @@ describe('Agent resume', () => {
+     expect(persistence.records.filter((record) => record.type === 'metadata')).toHaveLength(1);
+   });
+ 
++  it('resumes a session with a context.apply_prune record to the pruned messages', async () => {
++    const persistence = new RecordingAgentPersistence([
++      resumeConfigRecord(),
++      {
++        type: 'turn.prompt',
++        input: [{ type: 'text', text: 'read these files' }],
++        origin: { kind: 'user' },
++      } as unknown as WireRecord,
++      {
++        type: 'context.append_message',
++        message: {
++          role: 'user',
++          content: [{ type: 'text', text: 'read these files' }],
++          toolCalls: [],
++          origin: { kind: 'user' },
++        },
++      } as unknown as WireRecord,
++      {
++        type: 'context.append_loop_event',
++        event: { type: 'step.begin', uuid: 's1', turnId: '0', step: 1 },
++      },
++      {
++        type: 'context.append_loop_event',
++        event: {
++          type: 'tool.call',
++          uuid: 'x1',
++          turnId: '0',
++          step: 1,
++          stepUuid: 's1',
++          toolCallId: 'call_1',
++          name: 'Read',
++          args: { path: 'a.txt' },
++        },
++      },
++      {
++        type: 'context.append_loop_event',
++        event: {
++          type: 'tool.result',
++          parentUuid: 'x1',
++          toolCallId: 'call_1',
++          result: { output: 'contents of a.txt' },
++        },
++      },
++      {
++        type: 'context.append_loop_event',
++        event: { type: 'step.end', uuid: 's1', turnId: '0', step: 1 },
++      },
++      {
++        type: 'context.apply_prune',
++        agentId: 'main',
++        dropCalls: ['call_1'],
++        truncateResults: [],
++        trigger: 'manual',
++        tokensBefore: 100,
++        tokensAfter: 40,
++        removedCount: 2,
++      },
++    ]);
++    const ctx = testAgent({ persistence, autoConfigure: false });
++
++    await ctx.restorePersisted();
++
++    const history = ctx.context.get();
++    expect(history.map((message) => message.role)).toEqual(['user']);
++    expect(history.some((message) => message.role === 'tool')).toBe(false);
++  });
++
+   it('does not reconstruct an event-point interruption after restore', async () => {
+     const persistence = new RecordingAgentPersistence([
+       resumeConfigRecord(),
+diff --git a/packages/agent-core-v2/test/wire/tree/fork.test.ts b/packages/agent-core-v2/test/wire/tree/fork.test.ts
+new file mode 100644
+index 000000000..410665fef
+--- /dev/null
++++ b/packages/agent-core-v2/test/wire/tree/fork.test.ts
+@@ -0,0 +1,88 @@
++import { describe, expect, it } from 'vitest';
++
++import { computeForkLine } from '#/wire/tree/fork';
++import type { WireRecord } from '#/wire/record';
++import type { WireLine } from '#/wire/tree/tree';
++
++function userPrompt(text: string): WireRecord {
++  return {
++    type: 'context.append_message',
++    message: { role: 'user', content: [{ type: 'text', text }], toolCalls: [] },
++  };
++}
++
++function assistantWithCall(id: string): WireRecord {
++  return {
++    type: 'context.append_message',
++    message: {
++      role: 'assistant',
++      content: [],
++      toolCalls: [{ type: 'function', id, name: 'Read', arguments: '{}' }],
++    },
++  };
++}
++
++function toolResult(id: string): WireRecord {
++  return {
++    type: 'context.append_message',
++    message: { role: 'tool', content: [{ type: 'text', text: `result ${id}` }], toolCalls: [], toolCallId: id },
++  };
++}
++
++const PRUNE_RECORD: WireRecord = {
++  type: 'context.apply_prune',
++  agentId: 'main',
++  dropCalls: ['c1'],
++  truncateResults: [],
++  trigger: 'manual',
++  tokensBefore: 100,
++  tokensAfter: 40,
++  removedCount: 2,
++};
++
++function chain(...records: readonly WireRecord[]): WireLine[] {
++  return records.map((record, index) => ({ record, line: index + 1 }));
++}
++
++describe('computeForkLine across a prune', () => {
++  it('forks from before a prune as if the prune were not a boundary', () => {
++    const entries = chain(
++      userPrompt('first'),
++      assistantWithCall('c1'),
++      toolResult('c1'),
++      PRUNE_RECORD,
++      userPrompt('second'),
++      assistantWithCall('c2'),
++      toolResult('c2'),
++    );
++
++    expect(computeForkLine(entries, new Set(), 1)).toBe(4);
++    expect(computeForkLine(entries, new Set(), 2)).toBe(0);
++  });
++
++  it('still refuses to cross a compaction summary after a prune', () => {
++    const summaryRecord: WireRecord = {
++      type: 'context.apply_compaction',
++      summary: 'summary',
++      compactedCount: 2,
++      tokensBefore: 100,
++      tokensAfter: 20,
++    };
++    const entries = chain(
++      userPrompt('first'),
++      PRUNE_RECORD,
++      {
++        type: 'context.append_message',
++        message: {
++          role: 'user',
++          content: [{ type: 'text', text: 'summary' }],
++          toolCalls: [],
++          origin: { kind: 'compaction_summary' },
++        },
++      },
++      userPrompt('second'),
++    );
++
++    expect(() => computeForkLine(entries, new Set(), 2)).toThrowError(/compaction_boundary/);
++  });
++});
+diff --git a/packages/node-sdk/test/sdk-rpc-client-v2.test.ts b/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
+index 5f6dbbe59..cd1166fdd 100644
+--- a/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
++++ b/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
+@@ -854,6 +854,57 @@ key = "${titleOAuthRef.key}"
+     }
+   });
+ 
++  it('folds a wire containing a context.apply_prune record with unchanged message counts', async () => {
++    const dir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-prune-fold-'));
++    tempDirs.push(dir);
++    const wirePath = join(dir, 'wire.jsonl');
++    const baseRecords = [
++      {
++        type: 'context.append_message',
++        message: { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [], origin: { kind: 'user' } },
++        time: 1,
++      },
++      {
++        type: 'context.append_message',
++        message: {
++          role: 'assistant',
++          content: [],
++          toolCalls: [{ type: 'function', id: 'c1', name: 'Read', arguments: '{}' }],
++        },
++        time: 2,
++      },
++      {
++        type: 'context.append_message',
++        message: { role: 'tool', content: [{ type: 'text', text: 'result' }], toolCalls: [], toolCallId: 'c1' },
++        time: 3,
++      },
++    ];
++    const pruneRecord = {
++      type: 'context.apply_prune',
++      agentId: 'main',
++      dropCalls: ['c1'],
++      truncateResults: [],
++      trigger: 'manual',
++      tokensBefore: 100,
++      tokensAfter: 40,
++      removedCount: 2,
++      time: 4,
++    };
++
++    await writeFile(wirePath, baseRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
++    const base = await foldAgentWireReplay(wirePath);
++    const baseMessages = base.replay.filter((record) => record.type === 'message').length;
++
++    await writeFile(
++      wirePath,
++      [...baseRecords, pruneRecord].map((record) => JSON.stringify(record)).join('\n') + '\n',
++    );
++    const pruned = await foldAgentWireReplay(wirePath);
++    const prunedMessages = pruned.replay.filter((record) => record.type === 'message').length;
++
++    expect(prunedMessages).toBe(baseMessages);
++  });
++
+   it('rejects a resume whose engine restore fails without an unhandled rejection from the overlapped fold', async () => {
+     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-resume-fail-'));
+     const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-v2-work-'));
+diff --git a/packages/transcript/src/history/foldFacts.ts b/packages/transcript/src/history/foldFacts.ts
+index fe8e41a5d..dcd933cea 100644
+--- a/packages/transcript/src/history/foldFacts.ts
++++ b/packages/transcript/src/history/foldFacts.ts
+@@ -563,6 +563,8 @@ export function foldWireRecordFacts(
+         undoAnchorFloor = undoAnchors.length;
+         break;
+       }
++      case 'context.apply_prune':
++        break;
+       case 'context.append_message': {
+         const message = (record as ContextAppendMessagePayload).message;
+         if (message?.role !== 'user' || !isUndoAnchorTurnOrigin(message.origin)) break;
+diff --git a/packages/transcript/test/layers.test.ts b/packages/transcript/test/layers.test.ts
+index 950e5344a..b55f0b245 100644
+--- a/packages/transcript/test/layers.test.ts
++++ b/packages/transcript/test/layers.test.ts
+@@ -1616,6 +1616,35 @@ describe('foldWireRecordFacts (cold facts)', () => {
+     expect(folded.items).toBe(base.items);
+   });
+ 
++  it('treats a context.apply_prune record as removed context, not an undo boundary', () => {
++    const userOne = {
++      type: 'context.append_message',
++      message: { role: 'user', content: [{ type: 'text', text: 'one' }], toolCalls: [], origin: { kind: 'user' } },
++      time: 1,
++    };
++    const userTwo = {
++      type: 'context.append_message',
++      message: { role: 'user', content: [{ type: 'text', text: 'two' }], toolCalls: [], origin: { kind: 'user' } },
++      time: 3,
++    };
++    const undoBoth = { type: 'context.undo', agentId: 'main', count: 2, time: 4 };
++    const prune = {
++      type: 'context.apply_prune',
++      agentId: 'main',
++      dropCalls: ['c1'],
++      truncateResults: [],
++      trigger: 'manual',
++      removedCount: 2,
++      time: 2,
++    };
++
++    const withoutPrune = foldWireRecordFacts([userOne, userTwo, undoBoth], baseWithMarker());
++    const withPrune = foldWireRecordFacts([userOne, prune, userTwo, undoBoth], baseWithMarker());
++
++    expect(withPrune).toEqual(withoutPrune);
++    expect(withPrune.items).toEqual(withoutPrune.items);
++  });
++
+   it('folds todo records into the global todo document, last write wins', () => {
+     const base = baseWithMarker();
+     const folded = foldWireRecordFacts(
+-- 
+2.56.0.windows.4
+
