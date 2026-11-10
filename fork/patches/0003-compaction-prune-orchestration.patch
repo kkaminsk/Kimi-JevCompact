@@ -1,0 +1,1066 @@
+From 3505ab884f967183a11c6596a597db0a6fcb9395 Mon Sep 17 00:00:00 2001
+From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
+Date: Tue, 10 Nov 2026 15:50:16 -0600
+Subject: [PATCH] feat(full-compaction): run the prune before any summary and
+ report the mode
+
+When a validated prune decision rides on the compaction task, the
+compaction service now applies it right after the pre-compaction hooks:
+abort checks bracket the synchronous apply, errors are logged and fall back
+to the built-in summary with the fallback mentioned in the prune note, and
+a recount decides the outcome. If the pruned context no longer blocks the
+next turn, compaction finishes in prune mode with no model request at all;
+otherwise the summary loop runs over the pruned history and the result is
+marked prune_then_summary, with the prune record ordered before the
+compaction record on the wire.
+
+CompactionResult carries the mode, the dropped and truncated counts, and
+the optional prune note everywhere a result is reported: the TUI notice
+branches on the mode, the PostCompact hook payload gains mode,
+dropped_calls, and truncated_results, telemetry compaction_finished gains
+the same three optional fields, and the full_compaction.complete durable
+record stores them (optionally, so older wires still replay). The TUI
+compaction block, the resume transcript, the replay fold, the kap-server
+event schemas, and the klient contract schema all understand the new
+fields. Docs (en and zh) describe the /compact prune flow and the
+PostCompact payload.
+---
+ .../src/tui/components/dialogs/compaction.ts  |  35 +++-
+ .../tui/controllers/session-event-handler.ts  |  11 ++
+ .../src/tui/controllers/session-replay.ts     |   4 +
+ .../src/tui/controllers/streaming-ui.ts       |  11 +-
+ apps/kimi-code/src/tui/kimi-tui.ts            |   7 +-
+ apps/kimi-code/src/tui/types.ts               |   4 +
+ .../tui/components/dialogs/compaction.test.ts |  44 ++++-
+ .../session-event-handler-compaction.test.ts  |  10 +-
+ .../session-event-handler-goal-queue.test.ts  |   3 +
+ .../kimi-code/test/tui/message-replay.test.ts |  10 +
+ docs/en/customization/hooks.md                |   2 +
+ docs/en/reference/slash-commands.md           |   2 +-
+ docs/zh/customization/hooks.md                |   2 +
+ docs/zh/reference/slash-commands.md           |   2 +-
+ .../src/agent/fullCompaction/compactionOps.ts |  17 +-
+ .../fullCompaction/fullCompactionService.ts   | 103 +++++++++-
+ .../src/agent/fullCompaction/types.ts         |   6 +
+ .../src/agent/replayBuilder/fold.ts           |   3 +
+ .../agent-core-v2/src/app/telemetry/events.ts |   6 +
+ .../agent/agentExternalHooksService.ts        |   3 +
+ .../fullCompaction/compactionOps.test.ts      |  11 +-
+ .../fullCompaction/fullCompaction.test.ts     | 180 +++++++++++++++++-
+ .../test/agent/replayBuilder/fold.test.ts     |   3 +
+ .../toolSelect/toolSelectService.test.ts      |  10 +-
+ .../test/app/telemetry/events.test.ts         |  16 ++
+ .../kap-server/src/protocol/events-zod.ts     |   4 +
+ packages/klient/src/contract/agent/events.ts  |   4 +
+ 27 files changed, 490 insertions(+), 23 deletions(-)
+
+diff --git a/apps/kimi-code/src/tui/components/dialogs/compaction.ts b/apps/kimi-code/src/tui/components/dialogs/compaction.ts
+index c941af923..4de66d4af 100644
+--- a/apps/kimi-code/src/tui/components/dialogs/compaction.ts
++++ b/apps/kimi-code/src/tui/components/dialogs/compaction.ts
+@@ -5,7 +5,9 @@
+  *   - constructed on `compaction.started` → blinking white bullet +
+  *     "Compacting context..." and optional custom instruction
+  *   - `markDone()` on `compaction.completed` → solid green bullet +
+- *     "Compaction complete (X → Y tokens)"
++ *     "Compaction complete (X → Y tokens)", or "Compacted (prune)" /
++ *     "Compacted (prune + summary)" with the dropped/truncated counts and
++ *     the hook note when the run pruned
+  *   - `markCanceled()` on `compaction.cancelled` → solid warning bullet +
+  *     "Compaction cancelled"
+  *
+@@ -21,6 +23,13 @@ import { currentTheme } from '#/tui/theme';
+ 
+ const BLINK_INTERVAL = 500;
+ 
++export interface CompactionDoneDetails {
++  readonly mode: 'summary' | 'prune' | 'prune_then_summary';
++  readonly droppedCalls: number;
++  readonly truncatedResults: number;
++  readonly pruneNote?: string;
++}
++
+ export class CompactionComponent extends Container {
+   private readonly ui: TUI | undefined;
+   private readonly headerText: Text;
+@@ -34,6 +43,7 @@ export class CompactionComponent extends Container {
+   private tokensBefore: number | undefined;
+   private tokensAfter: number | undefined;
+   private summary: string | undefined;
++  private details: CompactionDoneDetails | undefined;
+   private summaryText: Text | undefined;
+   private expanded = false;
+ 
+@@ -86,12 +96,18 @@ export class CompactionComponent extends Container {
+     super.invalidate();
+   }
+ 
+-  markDone(tokensBefore?: number, tokensAfter?: number, summary?: string): void {
++  markDone(
++    tokensBefore?: number,
++    tokensAfter?: number,
++    summary?: string,
++    details?: CompactionDoneDetails,
++  ): void {
+     if (this.done || this.canceled) return;
+     this.done = true;
+     this.tokensBefore = tokensBefore;
+     this.tokensAfter = tokensAfter;
+     this.summary = summary;
++    this.details = details;
+     this.stopBlink();
+     this.headerText.setText(this.buildHeader());
+     if (this.expanded) {
+@@ -160,11 +176,24 @@ export class CompactionComponent extends Container {
+   private buildHeader(): string {
+     if (this.done) {
+       const bullet = currentTheme.fg('success', STATUS_BULLET);
+-      const label = currentTheme.boldFg('success', 'Compaction complete');
+       const detail =
+         this.tokensBefore !== undefined && this.tokensAfter !== undefined
+           ? currentTheme.dim(` (${String(this.tokensBefore)} → ${String(this.tokensAfter)} tokens)`)
+           : '';
++      if (this.details !== undefined && this.details.mode !== 'summary') {
++        const modeLabel =
++          this.details.mode === 'prune' ? 'Compacted (prune)' : 'Compacted (prune + summary)';
++        const label = currentTheme.boldFg('success', modeLabel);
++        const counts = currentTheme.dim(
++          `dropped ${String(this.details.droppedCalls)} tool call${this.details.droppedCalls === 1 ? '' : 's'}, truncated ${String(this.details.truncatedResults)} result${this.details.truncatedResults === 1 ? '' : 's'}`,
++        );
++        const note =
++          this.details.pruneNote !== undefined && this.details.pruneNote.length > 0
++            ? currentTheme.dim(` — ${this.details.pruneNote}`)
++            : '';
++        return `${bullet}${label} ${counts}${detail}${note}`;
++      }
++      const label = currentTheme.boldFg('success', 'Compaction complete');
+       const shortcutHint =
+         this.summary !== undefined && this.summary.length > 0
+           ? currentTheme.dim(` (Ctrl-O to ${this.expanded ? 'hide' : 'show'} compaction summary)`)
+diff --git a/apps/kimi-code/src/tui/controllers/session-event-handler.ts b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+index a10f83478..644ce51c6 100644
+--- a/apps/kimi-code/src/tui/controllers/session-event-handler.ts
++++ b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+@@ -81,6 +81,7 @@ import type { SurveyController } from './survey-controller';
+ import type { TasksBrowserController } from './tasks-browser';
+ import { SubAgentEventHandler } from './subagent-event-handler';
+ import { NotifyController } from './notify';
++import type { CompactionDoneDetails } from '../components/dialogs/compaction';
+ import {
+   sumTokenUsage,
+   type AppState,
+@@ -1156,6 +1157,7 @@ export class SessionEventHandler {
+       event.result.tokensBefore,
+       event.result.tokensAfter,
+       event.result.summary,
++      compactionDoneDetails(event.result),
+     );
+     // A completed compaction just refreshed and shrank the cached context —
+     // count it as activity so the next submit isn't judged against the
+@@ -1319,3 +1321,12 @@ export class SessionEventHandler {
+     state.ui.requestRender();
+   }
+ }
++
++function compactionDoneDetails(result: CompactionCompletedEvent['result']): CompactionDoneDetails {
++  return {
++    mode: result.mode,
++    droppedCalls: result.droppedCalls,
++    truncatedResults: result.truncatedResults,
++    pruneNote: result.pruneNote,
++  };
++}
+diff --git a/apps/kimi-code/src/tui/controllers/session-replay.ts b/apps/kimi-code/src/tui/controllers/session-replay.ts
+index 3935cfcd8..1b4443fc5 100644
+--- a/apps/kimi-code/src/tui/controllers/session-replay.ts
++++ b/apps/kimi-code/src/tui/controllers/session-replay.ts
+@@ -646,6 +646,10 @@ export class SessionReplayRenderer {
+         tokensBefore: record.result.tokensBefore,
+         tokensAfter: record.result.tokensAfter,
+         instruction: record.instruction,
++        mode: record.result.mode,
++        droppedCalls: record.result.droppedCalls,
++        truncatedResults: record.result.truncatedResults,
++        pruneNote: record.result.pruneNote,
+       },
+     });
+   }
+diff --git a/apps/kimi-code/src/tui/controllers/streaming-ui.ts b/apps/kimi-code/src/tui/controllers/streaming-ui.ts
+index e0c67a668..58caeec4e 100644
+--- a/apps/kimi-code/src/tui/controllers/streaming-ui.ts
++++ b/apps/kimi-code/src/tui/controllers/streaming-ui.ts
+@@ -3,7 +3,7 @@ import type { Session } from '@moonshot-ai/kimi-code-sdk';
+ import { AgentGroupComponent } from '../components/messages/agent-group';
+ import { AssistantMessageComponent } from '../components/messages/assistant-message';
+ import { currentWorkingTip } from '../components/chrome/working-tips';
+-import { CompactionComponent } from '../components/dialogs/compaction';
++import { CompactionComponent, type CompactionDoneDetails } from '../components/dialogs/compaction';
+ import { ReadGroupComponent } from '../components/messages/read-group';
+ import { ThinkingComponent } from '../components/messages/thinking';
+ import { ToolCallComponent } from '../components/messages/tool-call';
+@@ -763,10 +763,15 @@ export class StreamingUIController {
+     state.ui.requestRender();
+   }
+ 
+-  endCompaction(tokensBefore?: number, tokensAfter?: number, summary?: string): void {
++  endCompaction(
++    tokensBefore?: number,
++    tokensAfter?: number,
++    summary?: string,
++    details?: CompactionDoneDetails,
++  ): void {
+     const block = this._activeCompactionBlock;
+     if (block === undefined) return;
+-    block.markDone(tokensBefore, tokensAfter, summary);
++    block.markDone(tokensBefore, tokensAfter, summary, details);
+     this._activeCompactionBlock = undefined;
+     this.host.state.ui.requestRender();
+   }
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index bfd5d0998..5bd28ec96 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -3010,7 +3010,12 @@ export class KimiTUI {
+       if (data.result === 'cancelled') {
+         block.markCanceled();
+       } else {
+-        block.markDone(data.tokensBefore, data.tokensAfter, data.summary);
++        block.markDone(data.tokensBefore, data.tokensAfter, data.summary, {
++          mode: data.mode ?? 'summary',
++          droppedCalls: data.droppedCalls ?? 0,
++          truncatedResults: data.truncatedResults ?? 0,
++          pruneNote: data.pruneNote,
++        });
+         if (this.state.toolOutputExpanded) {
+           block.setExpanded(true);
+         }
+diff --git a/apps/kimi-code/src/tui/types.ts b/apps/kimi-code/src/tui/types.ts
+index b42bae1ad..6d1853150 100644
+--- a/apps/kimi-code/src/tui/types.ts
++++ b/apps/kimi-code/src/tui/types.ts
+@@ -183,6 +183,10 @@ export interface CompactionTranscriptData {
+   readonly tokensBefore?: number;
+   readonly tokensAfter?: number;
+   readonly instruction?: string;
++  readonly mode?: 'summary' | 'prune' | 'prune_then_summary';
++  readonly droppedCalls?: number;
++  readonly truncatedResults?: number;
++  readonly pruneNote?: string;
+ }
+ 
+ export interface CronTranscriptData {
+diff --git a/apps/kimi-code/test/tui/components/dialogs/compaction.test.ts b/apps/kimi-code/test/tui/components/dialogs/compaction.test.ts
+index eb213cfa2..3cb349dd4 100644
+--- a/apps/kimi-code/test/tui/components/dialogs/compaction.test.ts
++++ b/apps/kimi-code/test/tui/components/dialogs/compaction.test.ts
+@@ -56,8 +56,7 @@ describe('CompactionComponent', () => {
+     }
+   });
+ 
+-  it('renders a cancelled terminal state', () => {
+-    const component = new CompactionComponent();
++  it('renders a cancelled terminal state', () => {    const component = new CompactionComponent();
+ 
+     try {
+       component.markCanceled();
+@@ -71,6 +70,47 @@ describe('CompactionComponent', () => {
+     }
+   });
+ 
++  it('renders prune mode with the dropped and truncated counts and the note', () => {
++    const component = new CompactionComponent();
++
++    try {
++      component.markDone(6_000, 3_000, '', {
++        mode: 'prune',
++        droppedCalls: 12,
++        truncatedResults: 5,
++        pruneNote: 'kept 41/58 messages',
++      });
++      const text = component.render(140).map(strip).join('\n');
++
++      expect(text).toContain('Compacted (prune)');
++      expect(text).toContain('dropped 12 tool calls, truncated 5 results');
++      expect(text).toContain('6000 → 3000 tokens');
++      expect(text).toContain('kept 41/58 messages');
++      expect(text).not.toContain('Compaction complete');
++    } finally {
++      component.dispose();
++    }
++  });
++
++  it('renders prune-then-summary mode with the counts', () => {
++    const component = new CompactionComponent();
++
++    try {
++      component.markDone(9_000, 2_000, 'A short summary.', {
++        mode: 'prune_then_summary',
++        droppedCalls: 3,
++        truncatedResults: 1,
++      });
++      const text = component.render(140).map(strip).join('\n');
++
++      expect(text).toContain('Compacted (prune + summary)');
++      expect(text).toContain('dropped 3 tool calls, truncated 1 result');
++      expect(text).not.toContain('Ctrl-O');
++    } finally {
++      component.dispose();
++    }
++  });
++
+   it('keeps the completed compaction summary hidden until expanded', () => {
+     const component = new CompactionComponent();
+ 
+diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
+index 75f3146c1..c44a91f20 100644
+--- a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
++++ b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
+@@ -71,7 +71,15 @@ const compactionCompleted = {
+   type: 'compaction.completed',
+   sessionId: 's1',
+   agentId: 'main',
+-  result: { summary: 'summary', tokensBefore: 100, tokensAfter: 10, compactedCount: 1 },
++  result: {
++    summary: 'summary',
++    tokensBefore: 100,
++    tokensAfter: 10,
++    compactedCount: 1,
++    mode: 'summary',
++    droppedCalls: 0,
++    truncatedResults: 0,
++  },
+ } as const;
+ 
+ const compactionCancelled = {
+diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-goal-queue.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-goal-queue.test.ts
+index 8ab9cfd54..7804bd933 100644
+--- a/apps/kimi-code/test/tui/controllers/session-event-handler-goal-queue.test.ts
++++ b/apps/kimi-code/test/tui/controllers/session-event-handler-goal-queue.test.ts
+@@ -160,6 +160,9 @@ function compactionCompletedEvent() {
+       tokensBefore: 100,
+       tokensAfter: 10,
+       compactedCount: 1,
++      mode: 'summary',
++      droppedCalls: 0,
++      truncatedResults: 0,
+     },
+   } as const;
+ }
+diff --git a/apps/kimi-code/test/tui/message-replay.test.ts b/apps/kimi-code/test/tui/message-replay.test.ts
+index fd8a0dfe7..4da4125c8 100644
+--- a/apps/kimi-code/test/tui/message-replay.test.ts
++++ b/apps/kimi-code/test/tui/message-replay.test.ts
+@@ -1556,6 +1556,9 @@ describe('KimiTUI resume message replay', () => {
+           compactedCount: 4,
+           tokensBefore: 120,
+           tokensAfter: 24,
++          mode: 'summary',
++          droppedCalls: 0,
++          truncatedResults: 0,
+         },
+         instruction: 'preserve implementation notes',
+       },
+@@ -1570,6 +1573,10 @@ describe('KimiTUI resume message replay', () => {
+       tokensBefore: 120,
+       tokensAfter: 24,
+       instruction: 'preserve implementation notes',
++      mode: 'summary',
++      droppedCalls: 0,
++      truncatedResults: 0,
++      pruneNote: undefined,
+     });
+     const collapsed = stripAnsi(driver.state.transcriptContainer.render(120).join('\n'));
+     expect(collapsed).toContain('Compaction complete');
+@@ -1593,6 +1600,9 @@ describe('KimiTUI resume message replay', () => {
+           compactedCount: 4,
+           tokensBefore: 120,
+           tokensAfter: 24,
++          mode: 'summary',
++          droppedCalls: 0,
++          truncatedResults: 0,
+         },
+       },
+     ]);
+diff --git a/docs/en/customization/hooks.md b/docs/en/customization/hooks.md
+index c3c1d1a80..cc8fed019 100644
+--- a/docs/en/customization/hooks.md
++++ b/docs/en/customization/hooks.md
+@@ -166,6 +166,8 @@ On exit code 0, the hook may print a JSON decision on stdout:
+ 
+ A decision is honoured only when every id exists in the history and its tool result has already arrived, no id appears in both lists, and `headChars` is a non-negative integer. Invalid decisions are ignored — the reason is logged — and compaction proceeds with the built-in behaviour. When several `PreCompact` hooks match, the first valid decision in configuration order wins and the rest are ignored. Empty stdout, `compactionDecision: "proceed"`, malformed JSON, or exit code 2 all mean "no prune": compaction runs exactly as it would without the hook.
+ 
++When a prune ran, the `PostCompact` payload reports what happened: `mode` is `summary`, `prune`, or `prune_then_summary`, and `dropped_calls` and `truncated_results` carry the counts alongside `estimated_token_count`.
++
+ ::: warning Note
+ A prune never rewrites user or assistant text; it only removes tool calls and truncates tool results. The model can re-run a pruned tool when it needs the data again.
+ :::
+diff --git a/docs/en/reference/slash-commands.md b/docs/en/reference/slash-commands.md
+index f33586afa..fb6deef33 100644
+--- a/docs/en/reference/slash-commands.md
++++ b/docs/en/reference/slash-commands.md
+@@ -32,7 +32,7 @@ Some commands are only available in the idle state. Executing these commands whi
+ | `/tasks` | `/task` | Browse the background task list | Yes |
+ | `/fork` | — | Fork a new session from the current one, preserving the full conversation history; you stay in the current session | No |
+ | `/title [<text>]` | `/rename` | Without arguments, display the current session title; with an argument, set a new title (max 200 characters) | Yes |
+-| `/compact [<instruction>]` | — | Compact the current conversation context to free up token usage; an optional custom instruction can hint to the model what to preserve | No |
++| `/compact [<instruction>]` | — | Compact the current conversation context to free up token usage; an optional custom instruction can hint to the model what to preserve. When a `PreCompact` hook returns a prune decision, Kimi drops the listed tool calls and truncates the listed results first, and only asks the model for a summary if the context is still over the limit | No |
+ | `/undo [<count>]` | — | Undo recent prompts from the active context. Without a count, opens a selector; with a count, undoes that many prompts. Prompts before the last compaction cannot be undone. Undoing also rolls back the todo list and plan mode state produced by those prompts (code changes are not reverted) | No |
+ | `/reload` | — | Reload the current session and apply the latest `config.toml` settings (providers, models, etc.) and `tui.toml` UI preferences, without restarting the CLI | No |
+ | `/reload-tui` | — | Reload only the `tui.toml` UI preferences (theme, editor, notifications, etc.) without rebuilding the session | Yes |
+diff --git a/docs/zh/customization/hooks.md b/docs/zh/customization/hooks.md
+index 1a49c64a6..1e27d21ea 100644
+--- a/docs/zh/customization/hooks.md
++++ b/docs/zh/customization/hooks.md
+@@ -166,6 +166,8 @@ payload 在基础字段之上新增以下字段：
+ 
+ 只有当每个 id 都存在于历史中、其工具结果已经返回、没有 id 同时出现在两个列表中、且 `headChars` 是非负整数时，决策才会被采纳。无效决策会被忽略 —— 原因会写入日志 —— 压缩按内置行为继续。多个 `PreCompact` hook 同时匹配时，以配置顺序为准，第一个有效决策胜出，其余被忽略。空 stdout、`compactionDecision: "proceed"`、格式错误的 JSON 或退出码 2 都表示"不 prune"：压缩与不安装该 hook 时完全一致。
+ 
++prune 执行后，`PostCompact` payload 会报告结果：`mode` 为 `summary`、`prune` 或 `prune_then_summary`，`dropped_calls` 和 `truncated_results` 携带数量，连同 `estimated_token_count`。
++
+ ::: warning 注意
+ prune 永远不会改写用户或 assistant 的文本，只会移除工具调用、截断工具结果。模型需要数据时可以重新运行被 prune 的工具。
+ :::
+diff --git a/docs/zh/reference/slash-commands.md b/docs/zh/reference/slash-commands.md
+index 5104b01ae..ce504aaa1 100644
+--- a/docs/zh/reference/slash-commands.md
++++ b/docs/zh/reference/slash-commands.md
+@@ -32,7 +32,7 @@
+ | `/tasks` | `/task` | 浏览后台任务列表 | 是 |
+ | `/fork` | — | 基于当前会话 fork 一份新会话，保留完整对话历史；fork 后仍停留在当前会话 | 否 |
+ | `/title [<text>]` | `/rename` | 不带参数时显示当前会话标题；带参数时设置为新标题（最长 200 字符） | 是 |
+-| `/compact [<instruction>]` | — | 压缩当前对话上下文，释放 token 占用；可附带自定义指令，提示模型压缩时保留哪些信息 | 否 |
++| `/compact [<instruction>]` | — | 压缩当前对话上下文，释放 token 占用；可附带自定义指令，提示模型压缩时保留哪些信息。当 `PreCompact` hook 返回 prune 决策时，Kimi 会先丢弃列出的工具调用、截断列出的工具结果，仅当上下文仍超限时才请求模型写摘要 | 否 |
+ | `/undo [<count>]` | — | 从当前上下文撤销最近的提示词。不带数量时打开选择器；带数量时撤销对应条数。最后一次上下文压缩之前的提示词不能撤销。撤销会一并回滚这些提示词产生的 todo 列表和计划模式状态（不回滚代码改动） | 否 |
+ | `/init` | — | 分析当前代码库并生成 `AGENTS.md` | 否 |
+ | `/export-md [<path>]` | `/export` | 将当前会话导出为 Markdown 文件 | 否 |
+diff --git a/packages/agent-core-v2/src/agent/fullCompaction/compactionOps.ts b/packages/agent-core-v2/src/agent/fullCompaction/compactionOps.ts
+index ddd55217e..816c7b057 100644
+--- a/packages/agent-core-v2/src/agent/fullCompaction/compactionOps.ts
++++ b/packages/agent-core-v2/src/agent/fullCompaction/compactionOps.ts
+@@ -10,7 +10,12 @@ import {
+ } from '#/agent/contextMemory/contextEvents';
+ import type { WireLineRange } from '#/wire/record';
+ 
+-import type { CompactionBeginData, CompactionResult, CompactionSource } from './types';
++import type {
++  CompactionBeginData,
++  CompactionMode,
++  CompactionResult,
++  CompactionSource,
++} from './types';
+ 
+ export type CompactionPhase = 'idle' | 'running' | 'cancelled' | 'completed';
+ 
+@@ -48,7 +53,12 @@ export interface FullCompactionCancel {
+   readonly agentId: string;
+ }
+ 
+-const fullCompactionCompleteSchema = z.object({ agentId: z.string() });
++const fullCompactionCompleteSchema = z.object({
++  agentId: z.string(),
++  mode: z.enum(['summary', 'prune', 'prune_then_summary']).optional(),
++  droppedCalls: z.number().int().nonnegative().optional(),
++  truncatedResults: z.number().int().nonnegative().optional(),
++});
+ 
+ export class FullCompactionComplete extends AgentEvent2<
+   z.infer<typeof fullCompactionCompleteSchema>
+@@ -59,6 +69,9 @@ export class FullCompactionComplete extends AgentEvent2<
+ }
+ export interface FullCompactionComplete {
+   readonly agentId: string;
++  readonly mode?: CompactionMode;
++  readonly droppedCalls?: number;
++  readonly truncatedResults?: number;
+ }
+ 
+ export interface CompactionStartedPayload {
+diff --git a/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts b/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts
+index 514dff0b3..9fa5904d9 100644
+--- a/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts
++++ b/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts
+@@ -52,6 +52,7 @@ import {
+   type FullCompactionInput,
+   type FullCompactionTask,
+ } from './fullCompaction';
++import type { ValidatedPruneDecision } from '#/features/externalHooks/internal/types';
+ import {
+   RuntimeCompactionStrategy,
+   type CompactionStrategy,
+@@ -102,6 +103,13 @@ interface CompactionAttemptResult {
+   readonly traceId?: string;
+ }
+ 
++interface PruneStepOutcome {
++  readonly tokensAfter: number;
++  readonly droppedCalls: number;
++  readonly truncatedResults: number;
++  readonly note?: string;
++}
++
+ class CompactionTruncatedError extends Error {
+   constructor() {
+     super('Compaction response was truncated before producing a complete summary.');
+@@ -453,9 +461,16 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+     return true;
+   }
+ 
+-  private markCompleted(active: ActiveCompaction): boolean {
++  private markCompleted(active: ActiveCompaction, result: CompactionResult): boolean {
+     if (this._compacting !== active) return false;
+-    void this.dispatcher.dispatch(new FullCompactionComplete({ agentId: this.agent.agentId }));
++    void this.dispatcher.dispatch(
++      new FullCompactionComplete({
++        agentId: this.agent.agentId,
++        mode: result.mode,
++        droppedCalls: result.droppedCalls,
++        truncatedResults: result.truncatedResults,
++      }),
++    );
+     this._compacting = null;
+     return true;
+   }
+@@ -586,7 +601,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+       const result = await this.compactionRound(active, data);
+       if (this._compacting !== active) throw compactionCancelledReason(active);
+       this.lastCompactedTokenCount = result.tokensAfter;
+-      if (!this.markCompleted(active)) {
++      if (!this.markCompleted(active, result)) {
+         throw compactionCancelledReason(active);
+       }
+       const { contextSummary: _contextSummary, ...eventResult } = result;
+@@ -625,7 +640,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+     data: Readonly<CompactionBeginData>,
+   ): Promise<CompactionResult> {
+     const startedAt = Date.now();
+-    const originalHistory = [...this.context.get()];
++    let originalHistory = [...this.context.get()];
+     const tokensBefore = this.requestTokens(originalHistory);
+     let retryCount = 0;
+     let thinkingEffort = this.profile.data().thinkingLevel;
+@@ -636,6 +651,49 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+ 
+       await this.hooks.onWillCompact.run(active);
+ 
++      let pruneOutcome: PruneStepOutcome | undefined;
++      let pruneFallbackNote: string | undefined;
++      if (active.pruneDecision !== undefined) {
++        const outcome = this.runPruneStep(active, active.pruneDecision);
++        if (outcome !== undefined) {
++          pruneOutcome = outcome;
++        } else {
++          pruneFallbackNote = 'prune failed; fell back to summary compaction';
++        }
++      }
++
++      if (pruneOutcome !== undefined && !this.strategy.shouldBlock(pruneOutcome.tokensAfter)) {
++        const properties: CompactionFinishedEvent = {
++          turn_id: active.originTurnId,
++          source: data.source,
++          tokens_before: tokensBefore,
++          tokens_after: pruneOutcome.tokensAfter,
++          duration_ms: Date.now() - startedAt,
++          compacted_count: 0,
++          retry_count: 0,
++          round: 1,
++          thinking_effort: thinkingEffort,
++          mode: 'prune',
++          dropped_calls: pruneOutcome.droppedCalls,
++          truncated_results: pruneOutcome.truncatedResults,
++        };
++        this.telemetry.track2('compaction_finished', properties);
++        return {
++          summary: '',
++          compactedCount: 0,
++          tokensBefore,
++          tokensAfter: pruneOutcome.tokensAfter,
++          mode: 'prune',
++          droppedCalls: pruneOutcome.droppedCalls,
++          truncatedResults: pruneOutcome.truncatedResults,
++          pruneNote: pruneOutcome.note,
++        };
++      }
++
++      if (pruneOutcome !== undefined) {
++        originalHistory = [...this.context.get()];
++      }
++
+       const resolvedModel = this.profile.resolveModelContext();
+       thinkingEffort = resolvedModel.thinkingLevel;
+       const maxContextTokens = resolvedModel.modelCapabilities.max_context_tokens;
+@@ -764,7 +822,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+       signal.throwIfAborted();
+       const recoveryFooter = this.renderRecoveryFooter(wireLines);
+       const summaryText = buildCompactionSummaryText(summary);
+-      const result = this.context.applyCompaction({
++      const applied = this.context.applyCompaction({
+         summary,
+         contextSummary:
+           recoveryFooter === undefined ? summaryText : `${summaryText}\n\n${recoveryFooter}`,
+@@ -779,6 +837,13 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+         droppedCount: droppedCount === 0 ? undefined : droppedCount,
+         wireLines,
+       });
++      const result: CompactionResult = {
++        ...applied,
++        mode: pruneOutcome === undefined ? 'summary' : 'prune_then_summary',
++        droppedCalls: pruneOutcome?.droppedCalls ?? 0,
++        truncatedResults: pruneOutcome?.truncatedResults ?? 0,
++        pruneNote: pruneOutcome?.note ?? pruneFallbackNote,
++      };
+ 
+       const properties: CompactionFinishedEvent = {
+         turn_id: active.originTurnId,
+@@ -792,6 +857,9 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+         round: 1,
+         thinking_effort: thinkingEffort,
+         trace_id: attempt.traceId,
++        mode: result.mode,
++        dropped_calls: result.droppedCalls,
++        truncated_results: result.truncatedResults,
+         ...usageTelemetry(attempt.usage),
+       };
+       this.telemetry.track2('compaction_finished', properties);
+@@ -855,6 +923,31 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+     return `${summary.trim()}\n\n${renderTodoList(todos, '## TODO List')}`;
+   }
+ 
++  private runPruneStep(
++    active: ActiveCompaction,
++    decision: ValidatedPruneDecision,
++  ): PruneStepOutcome | undefined {
++    try {
++      active.abortController.signal.throwIfAborted();
++      this.context.applyPrune({
++        dropCalls: decision.dropCalls,
++        truncateResults: decision.truncateResults,
++        note: decision.note,
++        trigger: active.trigger,
++      });
++      active.abortController.signal.throwIfAborted();
++      return {
++        tokensAfter: this.requestTokens(this.context.get()),
++        droppedCalls: decision.dropCalls.length,
++        truncatedResults: decision.truncateResults.length,
++        note: decision.note,
++      };
++    } catch (error) {
++      onUnexpectedError(error);
++      return undefined;
++    }
++  }
++
+   private async captureWireLines(): Promise<WireLineRange | undefined> {
+     try {
+       await this.wire.flush();
+diff --git a/packages/agent-core-v2/src/agent/fullCompaction/types.ts b/packages/agent-core-v2/src/agent/fullCompaction/types.ts
+index 14930a6f7..b23188a53 100644
+--- a/packages/agent-core-v2/src/agent/fullCompaction/types.ts
++++ b/packages/agent-core-v2/src/agent/fullCompaction/types.ts
+@@ -1,3 +1,5 @@
++export type CompactionMode = 'summary' | 'prune' | 'prune_then_summary';
++
+ export interface CompactionResult {
+   summary: string;
+   contextSummary?: string;
+@@ -7,6 +9,10 @@ export interface CompactionResult {
+   keptUserMessageCount?: number;
+   keptHeadUserMessageCount?: number;
+   droppedCount?: number;
++  mode: CompactionMode;
++  droppedCalls: number;
++  truncatedResults: number;
++  pruneNote?: string;
+ }
+ 
+ export type CompactionSource = 'manual' | 'auto';
+diff --git a/packages/agent-core-v2/src/agent/replayBuilder/fold.ts b/packages/agent-core-v2/src/agent/replayBuilder/fold.ts
+index 23eb6a2c1..3be566e10 100644
+--- a/packages/agent-core-v2/src/agent/replayBuilder/fold.ts
++++ b/packages/agent-core-v2/src/agent/replayBuilder/fold.ts
+@@ -347,6 +347,9 @@ class WireReplayFoldState {
+       keptUserMessageCount: readNumber(record, 'keptUserMessageCount') ?? keptTail.length,
+       keptHeadUserMessageCount: readNumber(record, 'keptHeadUserMessageCount'),
+       droppedCount: readNumber(record, 'droppedCount'),
++      mode: 'summary',
++      droppedCalls: 0,
++      truncatedResults: 0,
+     };
+     this.patchLastCompaction({ result });
+     const summaryMessage: ContextMessage = {
+diff --git a/packages/agent-core-v2/src/app/telemetry/events.ts b/packages/agent-core-v2/src/app/telemetry/events.ts
+index cce6f5575..66681691b 100644
+--- a/packages/agent-core-v2/src/app/telemetry/events.ts
++++ b/packages/agent-core-v2/src/app/telemetry/events.ts
+@@ -254,6 +254,9 @@ export interface CompactionFinishedEvent {
+   input_cache_read?: number;
+   input_cache_creation?: number;
+   trace_id?: string;
++  mode?: 'summary' | 'prune' | 'prune_then_summary';
++  dropped_calls?: number;
++  truncated_results?: number;
+ }
+ 
+ export interface CompactionFailedEvent {
+@@ -908,6 +911,9 @@ export const telemetryEventDefinitions = {
+       input_cache_creation: 'Cache-creation input tokens',
+       trace_id:
+         'Trace id of the final compaction request round; absent for non-Kimi protocols',
++      mode: "How the compaction did its work: 'summary', 'prune', or 'prune_then_summary'",
++      dropped_calls: 'Tool calls dropped by a prune-mode compaction',
++      truncated_results: 'Tool results truncated by a prune-mode compaction',
+     },
+   }),
+   compaction_failed: defineAgentTelemetryEvent<CompactionFailedEvent>({
+diff --git a/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts b/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts
+index d061643f1..c7391d20e 100644
+--- a/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts
++++ b/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts
+@@ -481,6 +481,9 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
+       {
+         trigger: ctx.trigger,
+         estimatedTokenCount: result.tokensAfter,
++        mode: result.mode,
++        dropped_calls: result.droppedCalls,
++        truncated_results: result.truncatedResults,
+       },
+       ctx.trigger,
+     );
+diff --git a/packages/agent-core-v2/test/agent/fullCompaction/compactionOps.test.ts b/packages/agent-core-v2/test/agent/fullCompaction/compactionOps.test.ts
+index 73e2a3992..50019e124 100644
+--- a/packages/agent-core-v2/test/agent/fullCompaction/compactionOps.test.ts
++++ b/packages/agent-core-v2/test/agent/fullCompaction/compactionOps.test.ts
+@@ -84,7 +84,9 @@ describe('fullCompaction ops (wire-backed)', () => {
+     void dispatcher.dispatch(new FullCompactionBegin({ agentId: 'test-agent', source: 'manual', instruction: 'keep facts' }));
+     expect(agentState.get(fullCompactionKey).phase).toBe('running');
+ 
+-    void dispatcher.dispatch(new FullCompactionComplete({ agentId: 'test-agent' }));
++    void dispatcher.dispatch(
++      new FullCompactionComplete({ agentId: 'test-agent', mode: 'summary', droppedCalls: 0, truncatedResults: 0 }),
++    );
+     expect(agentState.get(fullCompactionKey).phase).toBe('idle');
+ 
+     void dispatcher.dispatch(new FullCompactionBegin({ agentId: 'test-agent', source: 'auto' }));
+@@ -110,6 +112,9 @@ describe('fullCompaction ops (wire-backed)', () => {
+     expect(records[1]).toEqual({
+       type: 'full_compaction.complete',
+       agentId: 'test-agent',
++      mode: 'summary',
++      droppedCalls: 0,
++      truncatedResults: 0,
+       time: expect.any(Number),
+     });
+   });
+@@ -128,7 +133,9 @@ describe('fullCompaction ops (wire-backed)', () => {
+ 
+   it('replay rebuilds the phase silently', async () => {
+     void dispatcher.dispatch(new FullCompactionBegin({ agentId: 'test-agent', source: 'manual' }));
+-    void dispatcher.dispatch(new FullCompactionComplete({ agentId: 'test-agent' }));
++    void dispatcher.dispatch(
++      new FullCompactionComplete({ agentId: 'test-agent', mode: 'prune', droppedCalls: 2, truncatedResults: 1 }),
++    );
+     const records = await readRecords();
+ 
+     const host = buildHost('full-compaction-replay');
+diff --git a/packages/agent-core-v2/test/agent/fullCompaction/fullCompaction.test.ts b/packages/agent-core-v2/test/agent/fullCompaction/fullCompaction.test.ts
+index 07649c39a..1b6710c43 100644
+--- a/packages/agent-core-v2/test/agent/fullCompaction/fullCompaction.test.ts
++++ b/packages/agent-core-v2/test/agent/fullCompaction/fullCompaction.test.ts
+@@ -271,7 +271,13 @@ describe('FullCompaction', () => {
+       const candidate = event as { type?: unknown; event?: unknown };
+       return candidate.type === '[wire]' && candidate.event === 'full_compaction.complete';
+     });
+-    expect(completeEvent?.args).toEqual({ agentId: 'main', time: '<time>' });
++    expect(completeEvent?.args).toEqual({
++      agentId: 'main',
++      mode: 'summary',
++      droppedCalls: 0,
++      truncatedResults: 0,
++      time: '<time>',
++    });
+     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
+       system: <system-prompt>
+       tools: Agent, AgentSwarm, CronCreate, CronDelete, CronList, EnterPlanMode, ExitPlanMode
+@@ -317,6 +323,9 @@ describe('FullCompaction', () => {
+         output_tokens: 8,
+         input_cache_read: 0,
+         input_cache_creation: 0,
++        mode: 'summary',
++        dropped_calls: 0,
++        truncated_results: 0,
+       }),
+     });
+     await ctx.expectResumeMatches();
+@@ -590,6 +599,9 @@ describe('FullCompaction', () => {
+       cwd: dir,
+       trigger: 'auto',
+       estimated_token_count: ctx.contextData().tokenCount,
++      mode: 'summary',
++      dropped_calls: 0,
++      truncated_results: 0,
+     });
+   });
+ 
+@@ -4459,3 +4471,169 @@ describe('FullCompaction pre-shrink', () => {
+     await ctx.expectResumeMatches();
+   });
+ });
++
++describe('compaction prune orchestration', () => {
++  function seedToolExchange(ctx: ReturnType<typeof testAgent>, toolCallId: string, resultText: string): void {
++    ctx.appendTurnExchange('look at this file', 'reading it now');
++    ctx.context.append(
++      {
++        role: 'assistant',
++        content: [],
++        toolCalls: [{ type: 'function', id: toolCallId, name: 'Read', arguments: '{}' }],
++      },
++      { role: 'tool', content: [{ type: 'text', text: resultText }], toolCalls: [], toolCallId },
++    );
++  }
++
++  function compactionCompletedResult(events: readonly unknown[]): Record<string, unknown> {
++    const event = events.find((entry) => {
++      if (typeof entry !== 'object' || entry === null) return false;
++      const candidate = entry as { readonly type?: unknown; readonly event?: unknown };
++      return candidate.type === '[rpc]' && candidate.event === 'compaction.completed';
++    }) as { readonly args?: { readonly result?: Record<string, unknown> } } | undefined;
++    if (event?.args?.result === undefined) {
++      throw new Error('compaction.completed rpc event not found');
++    }
++    return event.args.result;
++  }
++
++  it('finishes in prune mode with no model request when the prune frees enough context', async () => {
++    const records: TelemetryRecord[] = [];
++    const ctx = testAgent({ telemetry: recordingTelemetry(records) });
++    ctx.configure({
++      provider: CATALOGUED_PROVIDER,
++      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
++      tools: SNAPSHOT_VISIBLE_TOOLS,
++    });
++    seedToolExchange(ctx, 'c1', 'file contents');
++
++    const service = ctx.get(IAgentFullCompactionService);
++    const hook = service.hooks.onWillCompact.register('test-prune', async (task, next) => {
++      task.pruneDecision = { dropCalls: ['c1'], truncateResults: [], note: 'kept 2/4' };
++      await next();
++    });
++    const completed = ctx.once('compaction.completed');
++
++    expect(service.begin({ source: 'manual' })).toBe(true);
++    await completed;
++    hook.dispose();
++
++    const events = ctx.newEvents();
++    const result = compactionCompletedResult(events);
++    expect(result).toEqual(
++      expect.objectContaining({
++        mode: 'prune',
++        droppedCalls: 1,
++        truncatedResults: 0,
++        summary: '',
++        pruneNote: 'kept 2/4',
++      }),
++    );
++    expect(ctx.context.get().some((message) => message.role === 'tool')).toBe(false);
++    const finished = records.filter((record) => record.event === 'compaction_finished');
++    expect(finished).toHaveLength(1);
++    expect(finished[0]?.properties).toEqual(
++      expect.objectContaining({ mode: 'prune', dropped_calls: 1, truncated_results: 0 }),
++    );
++    expect(finished[0]?.properties).not.toHaveProperty('input_tokens');
++    expect(events.some((entry) => {
++      if (typeof entry !== 'object' || entry === null) return false;
++      const candidate = entry as { readonly event?: unknown };
++      return candidate.event === 'context.apply_compaction';
++    })).toBe(false);
++  });
++
++  it('falls through to one summary request over the pruned history when the prune is not enough', async () => {
++    const ctx = testAgent();
++    ctx.configure({
++      provider: CATALOGUED_PROVIDER,
++      modelCapabilities: { ...CATALOGUED_MODEL_CAPABILITIES, max_context_tokens: 4_000 },
++      tools: SNAPSHOT_VISIBLE_TOOLS,
++    });
++    seedToolExchange(ctx, 'big1', 'x'.repeat(16_000));
++
++    const service = ctx.get(IAgentFullCompactionService);
++    const hook = service.hooks.onWillCompact.register('test-prune', async (task, next) => {
++      task.pruneDecision = { dropCalls: ['big1'], truncateResults: [] };
++      await next();
++    });
++    const completed = ctx.once('compaction.completed');
++
++    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
++    expect(service.begin({ source: 'manual' })).toBe(true);
++    await completed;
++    hook.dispose();
++
++    const events = ctx.newEvents();
++    const result = compactionCompletedResult(events);
++    expect(result).toEqual(
++      expect.objectContaining({ mode: 'prune_then_summary', droppedCalls: 1, truncatedResults: 0 }),
++    );
++    expect(ctx.lastLlmInput()).not.toContain('xxxxxxxx');
++    const pruneIndex = events.findIndex((entry) => {
++      if (typeof entry !== 'object' || entry === null) return false;
++      return (entry as { readonly event?: unknown }).event === 'context.apply_prune';
++    });
++    const compactionIndex = events.findIndex((entry) => {
++      if (typeof entry !== 'object' || entry === null) return false;
++      return (entry as { readonly event?: unknown }).event === 'context.apply_compaction';
++    });
++    expect(pruneIndex).toBeGreaterThanOrEqual(0);
++    expect(compactionIndex).toBeGreaterThan(pruneIndex);
++  });
++
++  it('falls back to the summary path when applying the prune fails', async () => {
++    const ctx = testAgent();
++    ctx.configure({
++      provider: CATALOGUED_PROVIDER,
++      modelCapabilities: { ...CATALOGUED_MODEL_CAPABILITIES, max_context_tokens: 4_000 },
++      tools: SNAPSHOT_VISIBLE_TOOLS,
++    });
++    seedToolExchange(ctx, 'c1', 'file contents');
++
++    const service = ctx.get(IAgentFullCompactionService);
++    const hook = service.hooks.onWillCompact.register('test-prune', async (task, next) => {
++      task.pruneDecision = { dropCalls: ['missing'], truncateResults: [] };
++      await next();
++    });
++    const completed = ctx.once('compaction.completed');
++
++    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
++    expect(service.begin({ source: 'manual' })).toBe(true);
++    await completed;
++    hook.dispose();
++
++    const result = compactionCompletedResult(ctx.newEvents());
++    expect(result).toEqual(
++      expect.objectContaining({ mode: 'summary', droppedCalls: 0, truncatedResults: 0 }),
++    );
++    expect(String(result.pruneNote)).toContain('prune failed');
++  });
++
++  it('leaves the context unchanged when cancelled during the prune step', async () => {
++    const ctx = testAgent();
++    ctx.configure({
++      provider: CATALOGUED_PROVIDER,
++      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
++      tools: SNAPSHOT_VISIBLE_TOOLS,
++    });
++    seedToolExchange(ctx, 'c1', 'file contents');
++
++    const service = ctx.get(IAgentFullCompactionService);
++    const hook = service.hooks.onWillCompact.register('test-prune-abort', async (task, next) => {
++      task.pruneDecision = { dropCalls: ['c1'], truncateResults: [] };
++      task.abortController.abort();
++      await next();
++    });
++    const cancelled = ctx.once('compaction.cancelled');
++
++    expect(service.begin({ source: 'manual' })).toBe(true);
++    await cancelled;
++    hook.dispose();
++
++    expect(
++      ctx.context.get().some((message) => message.role === 'tool' && message.toolCallId === 'c1'),
++    ).toBe(true);
++    expect(countEvents(ctx.newEvents(), 'context.apply_prune')).toBe(0);
++  });
++});
+diff --git a/packages/agent-core-v2/test/agent/replayBuilder/fold.test.ts b/packages/agent-core-v2/test/agent/replayBuilder/fold.test.ts
+index d79f2824e..c2f6c3cd3 100644
+--- a/packages/agent-core-v2/test/agent/replayBuilder/fold.test.ts
++++ b/packages/agent-core-v2/test/agent/replayBuilder/fold.test.ts
+@@ -233,6 +233,9 @@ describe('foldWireRecords', () => {
+           keptUserMessageCount: 2,
+           keptHeadUserMessageCount: 1,
+           droppedCount: 1,
++          mode: 'summary',
++          droppedCalls: 0,
++          truncatedResults: 0,
+         },
+       },
+     ]);
+diff --git a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
+index cda0967c4..0e63884f1 100644
+--- a/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
++++ b/packages/agent-core-v2/test/agent/toolSelect/toolSelectService.test.ts
+@@ -907,7 +907,15 @@ describe('AgentToolSelectService.load', () => {
+     h.sut.load([MCP_ALPHA]);
+     h.eventBus.publish(
+       new CompactionCompleted({ agentId: 'main',
+-        result: { summary: '', compactedCount: 0, tokensBefore: 0, tokensAfter: 0 },
++        result: {
++          summary: '',
++          compactedCount: 0,
++          tokensBefore: 0,
++          tokensAfter: 0,
++          mode: 'summary',
++          droppedCalls: 0,
++          truncatedResults: 0,
++        },
+       }),
+     );
+     expect(h.sut.load([MCP_ALPHA]).toLoad).toEqual([MCP_ALPHA]);
+diff --git a/packages/agent-core-v2/test/app/telemetry/events.test.ts b/packages/agent-core-v2/test/app/telemetry/events.test.ts
+index 5c0191ead..0a96a76e9 100644
+--- a/packages/agent-core-v2/test/app/telemetry/events.test.ts
++++ b/packages/agent-core-v2/test/app/telemetry/events.test.ts
+@@ -47,4 +47,20 @@ describe('telemetry event registry', () => {
+       agent_id: string;
+     }>();
+   });
++
++  it('documents the compaction mode, dropped calls, and truncated results on compaction_finished', () => {
++    const definition = telemetryEventDefinitions.compaction_finished;
++    expect(Object.keys(definition.meta.properties)).toEqual(
++      expect.arrayContaining(['mode', 'dropped_calls', 'truncated_results']),
++    );
++    expectTypeOf<
++      Pick<TelemetryEventProperties<'compaction_finished'>, 'mode'>
++    >().toEqualTypeOf<{ mode?: 'summary' | 'prune' | 'prune_then_summary' }>();
++    expectTypeOf<
++      Pick<TelemetryEventProperties<'compaction_finished'>, 'dropped_calls'>
++    >().toEqualTypeOf<{ dropped_calls?: number }>();
++    expectTypeOf<
++      Pick<TelemetryEventProperties<'compaction_finished'>, 'truncated_results'>
++    >().toEqualTypeOf<{ truncated_results?: number }>();
++  });
+ });
+diff --git a/packages/kap-server/src/protocol/events-zod.ts b/packages/kap-server/src/protocol/events-zod.ts
+index 85d88c165..d5b334430 100644
+--- a/packages/kap-server/src/protocol/events-zod.ts
++++ b/packages/kap-server/src/protocol/events-zod.ts
+@@ -461,6 +461,10 @@ export const compactionResultSchema = z.object({
+   keptUserMessageCount: z.number().optional(),
+   keptHeadUserMessageCount: z.number().optional(),
+   droppedCount: z.number().optional(),
++  mode: z.enum(['summary', 'prune', 'prune_then_summary']),
++  droppedCalls: z.number(),
++  truncatedResults: z.number(),
++  pruneNote: z.string().optional(),
+ }) satisfies z.ZodType<CompactionResult>;
+ 
+ export const toolUpdateSchema = z.object({
+diff --git a/packages/klient/src/contract/agent/events.ts b/packages/klient/src/contract/agent/events.ts
+index 15516f30c..640f045b1 100644
+--- a/packages/klient/src/contract/agent/events.ts
++++ b/packages/klient/src/contract/agent/events.ts
+@@ -167,6 +167,10 @@ export const compactionCompletedEventSchema = z.object({
+     keptUserMessageCount: z.number().optional(),
+     keptHeadUserMessageCount: z.number().optional(),
+     droppedCount: z.number().optional(),
++    mode: z.enum(['summary', 'prune', 'prune_then_summary']),
++    droppedCalls: z.number(),
++    truncatedResults: z.number(),
++    pruneNote: z.string().optional(),
+   }),
+ });
+ 
+-- 
+2.56.0.windows.4
+
