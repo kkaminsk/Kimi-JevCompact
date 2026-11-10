@@ -31,6 +31,33 @@ The managed copy under `$KIMI_CODE_HOME/plugins/managed/kimi-jevcompact/`
 contains the committed `dist/hook.mjs` bundle; no build or install step runs
 at install time.
 
+## Running the patched build
+
+The plugin needs a Kimi build that honours prune decisions. Stock `kimi`
+ignores them (the plugin's `/kimi-jevcompact:doctor` shows a failing
+prune-contract check there); the patched build installs as a separate
+`kimi-jev` binary and never touches the managed `kimi`.
+
+```sh
+bash fork/apply.sh   # clone upstream at the pinned commit, apply 0001-0004, test
+bash fork/build.sh   # SEA build; installs ~/.kimi-code/bin/kimi-jev
+kimi-jev --version   # 2.1.1+jev.1
+```
+
+- **Update** to a newer upstream: follow [`fork/rebase.md`](fork/rebase.md),
+  then re-run `apply.sh` and `build.sh`.
+- **Rollback**: delete `~/.kimi-code/bin/kimi-jev` and
+  `~/.kimi-code/kimi-jev.version`; the stock `kimi` was never modified.
+- **Sessions pruned by `kimi-jev` open only in `kimi-jev`** (the
+  `context.apply_prune` record is unknown to stock builds).
+- **Verify an install end to end** (spends real Jev credits):
+  `TYPESAFE_API_KEY=... bash fork/verify-e2e.sh`, or
+  `bash fork/verify-e2e.sh --expect-summary` with the plugin disabled to
+  confirm the summary fallback.
+
+To propose the contract upstream, see
+[`docs/upstream/feature-request.md`](docs/upstream/feature-request.md).
+
 ## Status
 
 Design phase. This repository currently holds a series of [OpenSpec](https://github.com/Fission-AI/OpenSpec)
