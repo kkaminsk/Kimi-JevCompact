@@ -5,7 +5,7 @@ import { defineConfig } from 'tsdown';
 // inlined; nothing external may remain except node: builtins.
 export default defineConfig({
   entry: ['plugin/src/hook.ts'],
-  outDir: 'plugin/dist',
+  outDir: 'dist',
   format: ['esm'],
   platform: 'node',
   minify: true,

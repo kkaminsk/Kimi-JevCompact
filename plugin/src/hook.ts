@@ -9,6 +9,7 @@ import {
 import { pathToFileURL } from 'node:url';
 
 import { resolveConfig, type HookConfig } from './config';
+import { formatDoctorReport, runDoctor } from './doctor';
 import { appendLogLine } from './log';
 import {
   goalFromPayload,
@@ -201,14 +202,52 @@ async function readStdin(): Promise<string> {
   return input;
 }
 
+export interface PostPayload {
+  readonly trigger?: string;
+  readonly estimated_token_count?: number;
+  readonly mode?: string;
+  readonly dropped_calls?: number;
+  readonly truncated_results?: number;
+  readonly session_id?: string;
+}
+
+export function runPost(payload: PostPayload, log: (entry: Record<string, unknown>) => void): void {
+  log({
+    outcome: 'post',
+    session_id: payload.session_id,
+    trigger: payload.trigger,
+    mode: payload.mode,
+    dropped_calls: payload.dropped_calls,
+    truncated_results: payload.truncated_results,
+    estimated_token_count: payload.estimated_token_count,
+  });
+}
+
 async function main(): Promise<void> {
+  const mode = process.argv[2];
+  const env = process.env;
+  if (mode === '--post') {
+    let payload: PostPayload = {};
+    try {
+      payload = JSON.parse(await readStdin()) as PostPayload;
+    } catch {
+      payload = {};
+    }
+    runPost(payload, (entry) => appendLogLine(env.KIMI_CODE_HOME, entry));
+    return;
+  }
+  if (mode === '--doctor') {
+    const checks = runDoctor(env, process.version);
+    process.stdout.write(`${formatDoctorReport(checks)}\n`);
+    return;
+  }
+
   let payload: HookPayload = {};
   try {
     payload = JSON.parse(await readStdin()) as HookPayload;
   } catch {
     payload = {};
   }
-  const env = process.env;
   const { config, warnings } = resolveConfig(env, env.KIMI_CODE_HOME);
   const timeoutSeconds = Number(env.KIMI_JEVCOMPACT_TIMEOUT_S ?? 120);
   const deadlineMs =

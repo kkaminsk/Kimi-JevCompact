@@ -12,7 +12,8 @@
     "test": "vitest run",
     "build": "tsdown",
     "check:bundle": "node scripts/check-bundle.mjs",
-    "verify": "npm run typecheck && npm test && npm run build && npm run check:bundle && openspec validate --all"
+    "check:plugin": "node scripts/check-plugin.mjs",
+    "verify": "npm run typecheck && npm test && npm run build && npm run check:bundle && npm run check:plugin && openspec validate --all"
   },
   "dependencies": {
     "fast-jev-compaction": "^0.4.1"

@@ -8,7 +8,7 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-const bundle = resolve('plugin/dist/hook.mjs');
+const bundle = resolve('dist/hook.mjs');
 
 function fail(message) {
   console.error(`check:bundle FAILED: ${message}`);

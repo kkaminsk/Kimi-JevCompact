@@ -9,6 +9,28 @@ Kimi-JevCompact instead scores every tool call and tool result with TypeSafe's J
 fast request, drops or truncates the ones that are no longer needed, and keeps everything else
 word for word. User and assistant text is never rewritten.
 
+## Install
+
+Kimi-JevCompact is a standard Kimi plugin with one prerequisite: the patched
+`kimi-jev` build (the stock `kimi` binary ignores prune decisions — see
+[`fork/`](fork/README.md)). With `kimi-jev` on your PATH:
+
+1. `/plugins install https://github.com/kkaminsk/Kimi-JevCompact`
+2. Enable `kimi-jevcompact` in the plugin manager.
+3. `/reload`
+4. Put your TypeSafe API key in `$KIMI_CODE_HOME/kimi-jevcompact.json`:
+
+   ```json
+   { "apiKey": "YOUR_TYPESAFE_KEY" }
+   ```
+
+5. Check the wiring with `/kimi-jevcompact:doctor`, then run `/compact` and
+   `/kimi-jevcompact:status` to see the prune outcome.
+
+The managed copy under `$KIMI_CODE_HOME/plugins/managed/kimi-jevcompact/`
+contains the committed `dist/hook.mjs` bundle; no build or install step runs
+at install time.
+
 ## Status
 
 Design phase. This repository currently holds a series of [OpenSpec](https://github.com/Fission-AI/OpenSpec)
