@@ -1,4 +1,4 @@
-From e75c9c72653cbf4d98347c9c3ee8f008f01bc7c4 Mon Sep 17 00:00:00 2001
+From 67273bc479e30c81f786a52b45223f38c4b2b5f3 Mon Sep 17 00:00:00 2001
 From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
 Date: Tue, 10 Nov 2026 14:57:45 -0600
 Subject: [PATCH] feat(context-memory): persist prunes as durable
@@ -27,9 +27,9 @@ across platforms.
  .../server/test/lib/context-projector.test.ts | 126 +++++++++++++++++
  .../web/src/components/context/ContextTab.tsx |   4 +
  .../src/components/context/PruneRibbon.tsx    |  28 ++++
- .../vis/web/src/components/wire/renderers.tsx |  30 +++-
+ .../vis/web/src/components/wire/renderers.tsx |  27 ++++
  .../agent-core-v2/docs/wire-manifest.d.ts     |  23 ++-
- .../scripts/gen-wire-manifest.mts             |  14 +-
+ .../scripts/gen-wire-manifest.mts             |   6 +-
  .../src/agent/contextMemory/contextEvents.ts  |  24 ++++
  .../src/agent/contextMemory/contextMemory.ts  |  22 ++-
  .../contextMemory/contextMemoryService.ts     |  40 +++++-
@@ -37,7 +37,7 @@ across platforms.
  .../agent/contextMemory/contextTranscript.ts  |  41 ++++++
  .../src/agent/contextMemory/types.ts          |   2 +
  .../src/agent/replayBuilder/fold.ts           |  32 +++++
- .../src/human/persist/v2/fold.ts              |  71 +++++++++-
+ .../src/human/persist/v2/fold.ts              |  67 +++++++++
  .../src/human/persist/v2/wire.ts              |  17 +++
  .../agent/contextMemory/pruneRecord.test.ts   | 132 ++++++++++++++++++
  .../agent/contextMemory/splice-replay.test.ts | 101 +++++++++++++-
@@ -50,7 +50,7 @@ across platforms.
  .../node-sdk/test/sdk-rpc-client-v2.test.ts   |  51 +++++++
  packages/transcript/src/history/foldFacts.ts  |   2 +
  packages/transcript/test/layers.test.ts       |  29 ++++
- 28 files changed, 1114 insertions(+), 20 deletions(-)
+ 28 files changed, 1107 insertions(+), 12 deletions(-)
  create mode 100644 apps/vis/web/src/components/context/PruneRibbon.tsx
  create mode 100644 packages/agent-core-v2/test/agent/contextMemory/pruneRecord.test.ts
  create mode 100644 packages/agent-core-v2/test/wire/tree/fork.test.ts
@@ -349,7 +349,7 @@ index 000000000..86c766d87
 +  );
 +}
 diff --git a/apps/vis/web/src/components/wire/renderers.tsx b/apps/vis/web/src/components/wire/renderers.tsx
-index af3338b94..13d1bc555 100644
+index af3338b94..55885e885 100644
 --- a/apps/vis/web/src/components/wire/renderers.tsx
 +++ b/apps/vis/web/src/components/wire/renderers.tsx
 @@ -538,6 +538,33 @@ export const WIRE_RENDERERS: RendererMap = {
@@ -386,16 +386,6 @@ index af3338b94..13d1bc555 100644
    'context.apply_compaction': {
      tone: 'compaction',
      label: 'compacted',
-@@ -557,8 +584,7 @@ export const WIRE_RENDERERS: RendererMap = {
-             </Pill>
-             <Dim>
-               {summary.label} {summary.text.length}b · {optionalNumberValue(record.tokensBefore, '?')}→
--              {optionalNumberValue(record.tokensAfter, '?')} tok ·{' '}
--              {compactedCount.value} msgs
-+              {optionalNumberValue(record.tokensAfter, '?')} tok ·{' '}              {compactedCount.value} msgs
-             </Dim>
-           </span>
-         ),
 diff --git a/packages/agent-core-v2/docs/wire-manifest.d.ts b/packages/agent-core-v2/docs/wire-manifest.d.ts
 index fcb577ac0..5f2f34ae4 100644
 --- a/packages/agent-core-v2/docs/wire-manifest.d.ts
@@ -449,7 +439,7 @@ index fcb577ac0..5f2f34ae4 100644
    "context.undo": ContextUndoPayload;
    "cron.add": CronAddPayload;
 diff --git a/packages/agent-core-v2/scripts/gen-wire-manifest.mts b/packages/agent-core-v2/scripts/gen-wire-manifest.mts
-index 6abca7411..2d4d58dcf 100644
+index 6abca7411..5d00ce5d6 100644
 --- a/packages/agent-core-v2/scripts/gen-wire-manifest.mts
 +++ b/packages/agent-core-v2/scripts/gen-wire-manifest.mts
 @@ -1,5 +1,5 @@
@@ -468,42 +458,6 @@ index 6abca7411..2d4d58dcf 100644
        const windowEnd = i + 1 < matches.length ? matches[i + 1]!.index : source.length;
        if (DURABLE_DECL_RE.test(source.slice(match.index, windowEnd))) durableTypes.add(type);
      }
-@@ -329,7 +329,7 @@ function emitTsDict(lines: string[], dict: SketchDict, indent: string): void {
-     lines.push(`${indent}${fieldKey}${optional ? '?' : ''}: ${typeLines[0]}${typeLines.length === 1 ? ';' : ''}`);
-     if (typeLines.length > 1) {
-       lines.push(...typeLines.slice(1, -1));
--      lines.push(`${typeLines[typeLines.length - 1]};`);
-+      lines.push(`${typeLines.at(-1)};`);
-     }
-   }
- }
-@@ -371,7 +371,7 @@ function renderPayloadDecl(
-       ...header,
-       `type ${name} = { ${nameField} } & (${lines[0]}`,
-       ...lines.slice(1, -1),
--      `${lines[lines.length - 1]});`,
-+      `${lines.at(-1)});`,
-       '',
-     ];
-   }
-@@ -449,7 +449,7 @@ function splitObjectFields(body: string): Map<string, string> {
-   for (const part of splitTopLevel(body)) {
-     const keyMatch = /^([$\w]+|'[^']+'|"[^"]+")\s*:/.exec(part);
-     if (keyMatch?.[1] !== undefined) {
--      const key = keyMatch[1].replace(/^['"]|['"]$/g, '');
-+      const key = keyMatch[1].replaceAll(/^['"]|['"]$/g, '');
-       fields.set(key, part.slice(keyMatch[0].length).trim());
-     } else if (part.startsWith('...')) {
-       fields.set(part, '');
-@@ -551,7 +551,7 @@ function splitTsTypeFields(body: string): Map<string, TsField> {
-   for (const part of splitTopLevel(body, [';', ','])) {
-     const m = /^(?:readonly\s+)?([$\w]+|'[^']+'|"[^"]+")\s*(\?)?\s*:\s*(.+)$/.exec(part);
-     if (m?.[1] !== undefined && m[3] !== undefined) {
--      fields.set(m[1].replace(/^['"]|['"]$/g, ''), {
-+      fields.set(m[1].replaceAll(/^['"]|['"]$/g, ''), {
-         type: m[3].trim(),
-         optional: m[2] !== undefined,
-       });
 @@ -888,7 +888,7 @@ export async function buildWireManifest(): Promise<string> {
    const { owners, importFiles, durableTypes, classTypes } = scanEventDeclarations();
    await import('../src/index.ts');
@@ -911,21 +865,9 @@ index 759081b28..23eb6a2c1 100644
    const summary = record['summary'];
    if (typeof summary === 'string') return summary;
 diff --git a/packages/agent-core-v2/src/human/persist/v2/fold.ts b/packages/agent-core-v2/src/human/persist/v2/fold.ts
-index e04251cfb..ba46a79f0 100644
+index e04251cfb..25a3c7834 100644
 --- a/packages/agent-core-v2/src/human/persist/v2/fold.ts
 +++ b/packages/agent-core-v2/src/human/persist/v2/fold.ts
-@@ -188,9 +188,9 @@ function truncateTextToTokensFromEnd(text: string, maxTokens: number): string {
-   let start = text.length;
-   for (let i = text.length - 1; i >= 0; i--) {
-     let isAscii = false;
--    const code = text.charCodeAt(i);
-+    const code = text.codePointAt(i);
-     if (code >= 0xdc00 && code <= 0xdfff && i > 0) {
--      const high = text.charCodeAt(i - 1);
-+      const high = text.codePointAt(i - 1);
-       if (high >= 0xd800 && high <= 0xdbff) {
-         i--;
-       }
 @@ -212,6 +212,66 @@ function replaceMessageText(message: V2ContextMessage, text: string): V2ContextM
    return { ...message, content: [{ type: 'text', text }], toolCalls: [] };
  }
