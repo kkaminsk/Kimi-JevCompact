@@ -3,6 +3,52 @@
 Canonical rules for any AI agent working in this repository. Claude Code reads
 this through `CLAUDE.md`. Kimi Code, Codex, Cursor, and Copilot read it directly.
 
+## Project status and architecture
+
+The repository is in the design phase: there is no product code or
+`package.json` yet. The seven active changes under `openspec/changes/` are the
+implementation plan; implement them in the order listed in `README.md`.
+
+Kimi-JevCompact preserves user and assistant text verbatim while using
+TypeSafe's Jev model to drop obsolete tool calls and truncate tool results. It
+has two deliverables:
+
+- A patch series against `MoonshotAI/kimi-code` at commit `b510fa9` (app 2.1.1).
+  The fork turns `PreCompact` into a mutating hook, persists pruning as a
+  durable context record, and falls back to the existing summary path when
+  pruning does not free enough context. The patched binary is `kimi-jev`.
+- A standard Kimi plugin whose bundled Node hook uses the published
+  `fast-jev-compaction` 0.4.1 library. Stock Kimi shell hooks cannot mutate
+  compaction, so the plugin requires the patched binary.
+
+For each change, read its `proposal.md`, `design.md`, `tasks.md`, and spec
+deltas before implementing. `openspec/config.yaml` is the canonical source for
+the upstream pin, key upstream files, and artifact rules.
+
+## Implementation guardrails
+
+- Never rewrite, inject, or synthesize user or assistant text. Only drop tool
+  calls and their matching results, or truncate tool results.
+- Preserve existing behavior when no valid prune decision is returned. Ignore
+  malformed or invalid decisions, log the reason, and proceed with normal
+  compaction. The plugin hook always prints a decision and exits 0.
+- Apply pruning through a deterministic `context.apply_prune` record and update
+  every replay consumer in the relevant change; in-memory-only pruning is not
+  sufficient.
+- Hook payload fields are snake_case; keys inside `hookSpecificOutput` are
+  camelCase. Preserve raw tool argument strings and tool-call/result pairing.
+- Use TypeScript strict mode, ESM, vitest, and npm for this repository. The
+  hook requires Node 20 or newer and must build to one self-contained file with
+  no runtime `node_modules`. Do not vendor `fast-jev-compaction` or add another
+  runtime dependency without a design change.
+- Fork builds require Node 24.15 or newer and pnpm 10.33. Keep the upstream
+  patch series explicit under `fork/`; do not replace it with a submodule.
+- Tests must not call TypeSafe or any other live service. Use a fake Jev
+  transport. Runtime network access is limited to the configurable TypeSafe
+  endpoint during compaction.
+- Never overwrite or replace the managed `kimi` binary. Install and verify the
+  patched build only as `kimi-jev`.
+
 ## Repository map
 
 | Path                            | Contents                                                                 |
@@ -19,18 +65,24 @@ this through `CLAUDE.md`. Kimi Code, Codex, Cursor, and Copilot read it directly
 | `scripts/`                      | `gh` setup scripts and the CI logic fixture test                         |
 | `plugin/`, `fork/`              | Planned by `openspec/changes/scaffold-kimi-jevcompact`; not present yet  |
 
-Commands. The npm scripts are defined by the `scaffold-kimi-jevcompact`
-change. Until it lands there is no `package.json`, and CI passes those steps
-with a notice.
+These checks are available in the current design-phase repository:
+
+```text
+bash scripts/test-ci-logic.sh
+npx --yes markdownlint-cli2 "**/*.md"
+npx --yes @fission-ai/openspec validate --all --strict
+```
+
+The npm scripts are defined by `scaffold-kimi-jevcompact`. Until that change
+lands there is no `package.json`, and CI passes the npm steps with a notice.
+Once it lands, run:
 
 ```text
 npm ci                                        # setup
 npm run typecheck                             # lint
 npm run build                                 # build (single-file hook bundle)
 npm test                                      # test
-npm run verify                                # everything CI runs, plus openspec validate --all
-bash scripts/test-ci-logic.sh                 # fixture tests for the CI gate logic
-npx --yes markdownlint-cli2 "**/*.md"         # docs lint, config in .markdownlint-cli2.jsonc
+npm run verify                                # typecheck, test, bundle checks, and OpenSpec validation
 ```
 
 ## Branching standard
@@ -53,10 +105,11 @@ Both are protected. No direct pushes, no force pushes, no deletion.
 | `docs/`    | `main`      | `main`    | `docs`                                             | `openspec-gate`, `conventional-title`, `docs-check` | Documentation-only work, published independently of app releases        |
 | `hotfix/`  | `main`      | `main`    | `fix`                                              | `openspec-gate`, `conventional-title`, `build-test` | Urgent production fix. The `fix:` title makes release-please cut a patch |
 
-Branch naming rule: the part after the prefix MUST equal the id of an existing
-OpenSpec change folder, `openspec/changes/<id>/`. Ids are lowercase, hyphenated,
-verb-first where natural: `add-dark-mode`, `fix-login-timeout`, `document-api`.
-One change per branch. One branch per change.
+Branch naming rule: the part after the prefix MUST equal the id of an active
+OpenSpec change folder, `openspec/changes/<id>/`, or an archived folder matching
+`openspec/changes/archive/*-<id>/` for follow-up work. Ids are lowercase,
+hyphenated, verb-first where natural: `add-dark-mode`, `fix-login-timeout`,
+`document-api`. One change per branch. One branch per change.
 
 The seven changes already under `openspec/changes/` are implemented on
 `feature/<id>` branches from `develop`, in the order the README lists them.
@@ -126,8 +179,10 @@ Use `!` or a `BREAKING CHANGE:` footer for breaking changes.
 
 OpenSpec (<https://github.com/Fission-AI/OpenSpec>) is the spec-driven change
 workflow. Every branch is the implementation of exactly one OpenSpec change.
-The installed CLI is 1.13.x with the custom profile that enables every
-workflow. Its slash commands are listed in `.claude/commands/opsx/`.
+The custom profile enables every workflow; slash commands are listed in
+`.claude/commands/opsx/` and skills in `.kimi-code/skills/`. Use `openspec`
+when installed globally or `npx --yes @fission-ai/openspec` otherwise, matching
+CI. Check `--help` rather than assuming a flag exists.
 
 ### Lifecycle for every branch
 
