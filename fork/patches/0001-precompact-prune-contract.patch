@@ -1,4 +1,4 @@
-From bf619ecb49c45820c18815ed122968558e65bf06 Mon Sep 17 00:00:00 2001
+From 4512ef71d95f0a6831d09f918fcb7cb6c30643af Mon Sep 17 00:00:00 2001
 From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
 Date: Tue, 10 Nov 2026 13:58:34 -0600
 Subject: [PATCH] feat(external-hooks): let PreCompact hooks return a validated
@@ -31,8 +31,8 @@ shape, and the validation rules.
  .../externalHooks/hookMessages.test.ts        | 122 ++++++++
  .../externalHooks/integration.test.ts         | 265 +++++++++++++++++-
  .../externalHooks/pruneDecision.test.ts       | 126 +++++++++
- .../features/externalHooks/runner.test.ts     |  71 ++++-
- 14 files changed, 886 insertions(+), 8 deletions(-)
+ .../features/externalHooks/runner.test.ts     |  69 +++++
+ 14 files changed, 885 insertions(+), 7 deletions(-)
  create mode 100644 packages/agent-core-v2/src/features/externalHooks/internal/hookMessages.ts
  create mode 100644 packages/agent-core-v2/src/features/externalHooks/internal/pruneDecision.ts
  create mode 100644 packages/agent-core-v2/test/features/externalHooks/hookMessages.test.ts
@@ -1142,18 +1142,9 @@ index 000000000..3eadb2f33
 +  });
 +});
 diff --git a/packages/agent-core-v2/test/features/externalHooks/runner.test.ts b/packages/agent-core-v2/test/features/externalHooks/runner.test.ts
-index 434225c4f..956585c2e 100644
+index 434225c4f..cf1971a6f 100644
 --- a/packages/agent-core-v2/test/features/externalHooks/runner.test.ts
 +++ b/packages/agent-core-v2/test/features/externalHooks/runner.test.ts
-@@ -7,7 +7,7 @@ import { HostProcessService } from '#/os/backends/node-local/hostProcessService'
- const hostProcess = new HostProcessService();
- 
- function nodeCommand(source: string): string {
--  return `node -e ${JSON.stringify(source.replace(/\s*\n\s*/g, ' '))}`;
-+  return `node -e ${JSON.stringify(source.replaceAll(/\s*\n\s*/g, ' '))}`;
- }
- 
- describe('runHook process runner', () => {
 @@ -144,6 +144,75 @@ describe('runHook process runner', () => {
      expect(result.reason).toBe('use rg');
    });
