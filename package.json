@@ -1,0 +1,27 @@
+{
+  "name": "kimi-jevcompact",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Verbatim, Jev-guided context compaction for Kimi Code CLI",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsdown",
+    "check:bundle": "node scripts/check-bundle.mjs",
+    "verify": "npm run typecheck && npm test && npm run build && npm run check:bundle && openspec validate --all"
+  },
+  "dependencies": {
+    "fast-jev-compaction": "^0.4.1"
+  },
+  "devDependencies": {
+    "@fission-ai/openspec": "1.17.0",
+    "@types/node": "24.0.10",
+    "tsdown": "0.23.7",
+    "typescript": "5.9.3",
+    "vitest": "5.1.0"
+  }
+}
