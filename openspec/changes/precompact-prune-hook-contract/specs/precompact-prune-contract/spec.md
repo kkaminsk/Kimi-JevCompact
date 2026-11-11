@@ -6,21 +6,23 @@ Defines the data a `PreCompact` hook receives and the prune decision it may retu
 
 ## ADDED Requirements
 
-### Requirement: PreCompact payload carries the history
+### Requirement: PreCompact payload carries session metadata
 
-When a `PreCompact` hook runs, the JSON on its stdin SHALL include, in addition to the existing fields (`hook_event_name`, `session_id`, `session_title`, `client_type`, `cwd`, `trigger`, `token_count`): `agent_id`, `max_context_tokens`, `instruction` (absent when none was given), and `messages`.
-
-`messages` SHALL be an array, oldest first, with one entry per message in the agent's current context. Each entry SHALL have `index` (position in the context), `role` (`system`, `user`, `assistant`, or `tool`), `origin_kind` (the message origin when present, e.g. `user`, `injection`, `compaction_summary`), `text` (the concatenated text parts; thinking parts excluded), `tool_calls` (array of `{ id, name, arguments }` for assistant messages, `arguments` as the raw string), `tool_call_id` (for tool messages), `is_error` (boolean), and `chars` (length of `text`).
-
-#### Scenario: Hook sees every tool exchange
-
-- **WHEN** the context holds an assistant message with two tool calls followed by two tool messages
-- **THEN** the payload has one assistant entry whose `tool_calls` lists both ids and two tool entries whose `tool_call_id` values match them, in order
+When a `PreCompact` hook runs, the JSON on its stdin SHALL include, in addition to the existing fields (`hook_event_name`, `session_id`, `session_title`, `client_type`, `cwd`, `trigger`, `token_count`): `agent_id`, `max_context_tokens`, `instruction` (absent when none was given), and `messages`. `messages` SHALL be an array, oldest first, with one entry per message in the agent's current context.
 
 #### Scenario: Existing hooks keep working
 
 - **WHEN** a `PreCompact` hook written before this change reads only `trigger`
 - **THEN** it still receives `trigger` with the same values (`manual` or `auto`) and runs unchanged
+
+### Requirement: Payload entries describe role, text, and tool linkage
+
+Each `messages` entry SHALL have `index` (position in the context), `role` (`system`, `user`, `assistant`, or `tool`), `origin_kind` (the message origin when present, e.g. `user`, `injection`, `compaction_summary`), `text` (the concatenated text parts; thinking parts excluded), `tool_calls` (array of `{ id, name, arguments }` for assistant messages, `arguments` as the raw string), `tool_call_id` (for tool messages), `is_error` (boolean), and `chars` (length of `text`).
+
+#### Scenario: Hook sees every tool exchange
+
+- **WHEN** the context holds an assistant message with two tool calls followed by two tool messages
+- **THEN** the payload has one assistant entry whose `tool_calls` lists both ids and two tool entries whose `tool_call_id` values match them, in order
 
 #### Scenario: Thinking is not exported
 
@@ -29,12 +31,7 @@ When a `PreCompact` hook runs, the JSON on its stdin SHALL include, in addition 
 
 ### Requirement: Hook may return a prune decision
 
-On exit code 0, if the hook's stdout is a JSON object whose `hookSpecificOutput.compactionDecision` equals `"prune"`, Kimi SHALL read `hookSpecificOutput.prune` with: `dropCalls` (array of tool call ids whose call and result are both removed), `truncateResults` (array of `{ toolCallId, headChars }`, the result is cut to its first `headChars` characters plus a one-line omission note), and optional `note` (string shown to the user). `compactionDecision: "proceed"`, a missing field, or any other stdout means no prune.
-
-#### Scenario: Valid prune is accepted
-
-- **WHEN** the hook prints a decision whose ids all exist in `messages` and exits 0
-- **THEN** Kimi records the decision for this compaction and the compaction proceeds in prune mode (see `compaction-prune-orchestration`)
+On exit code 0, if the hook's stdout is a JSON object whose `hookSpecificOutput.compactionDecision` equals `"prune"`, Kimi SHALL read the prune decision from `hookSpecificOutput.prune`. `compactionDecision: "proceed"`, a missing field, or any other stdout means no prune.
 
 #### Scenario: No output means built-in compaction
 
@@ -45,6 +42,15 @@ On exit code 0, if the hook's stdout is a JSON object whose `hookSpecificOutput.
 
 - **WHEN** the hook exits 2
 - **THEN** compaction still runs with the built-in behaviour (PreCompact remains non-blocking) and the stderr text is logged
+
+### Requirement: Prune decision names drops and truncations
+
+`hookSpecificOutput.prune` SHALL contain `dropCalls` (array of tool call ids whose call and result are both removed), `truncateResults` (array of `{ toolCallId, headChars }`; the result is cut to its first `headChars` characters plus a one-line omission note), and optional `note` (string shown to the user).
+
+#### Scenario: Valid prune is accepted
+
+- **WHEN** the hook prints a decision whose ids all exist in `messages` and exits 0
+- **THEN** Kimi records the decision for this compaction and the compaction proceeds in prune mode (see `compaction-prune-orchestration`)
 
 ### Requirement: Decisions are validated in Kimi
 
