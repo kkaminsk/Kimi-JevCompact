@@ -1,6 +1,9 @@
 node_modules/
-dist/
 *.log
 .env
 *.local
 kimi-jevcompact.json
+dist/*
+!dist/hook.mjs
+fork/build/
+

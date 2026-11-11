@@ -1,0 +1,28 @@
+{
+  "name": "kimi-jevcompact",
+  "version": "0.1.0",
+  "description": "Verbatim, Jev-guided context compaction for Kimi Code CLI: prune obsolete tool calls instead of summarising them away.",
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "sessionStart": {
+    "skill": "using-kimi-jevcompact"
+  },
+  "hooks": [
+    {
+      "event": "PreCompact",
+      "command": "node ./dist/hook.mjs",
+      "timeout": 120
+    },
+    {
+      "event": "PostCompact",
+      "command": "node ./dist/hook.mjs --post",
+      "timeout": 10
+    }
+  ],
+  "interface": {
+    "displayName": "Kimi-JevCompact",
+    "shortDescription": "Verbatim, Jev-guided context compaction (requires the patched kimi-jev build)",
+    "longDescription": "Scores every tool call with TypeSafe's Jev model during compaction, drops or truncates the ones that are no longer needed, and keeps all user and assistant text word for word. User and assistant text is never rewritten. Requires the patched kimi-jev build; see /kimi-jevcompact:doctor.",
+    "developerName": "kkaminsk"
+  }
+}
