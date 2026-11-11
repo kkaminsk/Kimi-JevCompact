@@ -1,0 +1,7 @@
+# Pinned upstream Kimi Code commit that the patch series in patches/ applies to.
+# Read by fork/apply.sh. Bump `series` whenever the patch series is rebased or
+# extended and `fork/build.sh` bakes it into the kimi-jev version suffix.
+sha: b510fa9
+version: 2.1.1
+date: 2026-10-13
+series: 1

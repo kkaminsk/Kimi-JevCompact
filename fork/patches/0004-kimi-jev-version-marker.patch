@@ -1,0 +1,74 @@
+From c4af8322c6aa8b3fe1a329cb69f9d7fe6c714e37 Mon Sep 17 00:00:00 2001
+From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
+Date: Tue, 10 Nov 2026 16:15:13 -0600
+Subject: [PATCH] feat(cli): mark kimi-jev builds with a startup version marker
+
+The patched build is distributed as kimi-jev beside the stock kimi binary.
+Two small changes make it identifiable: the native bundle's version define
+gains an optional KIMI_CODE_JEV_SUFFIX suffix (so kimi-jev --version prints
+2.1.1+jev.1 when the build script sets it), and every CLI start writes
+$KIMI_CODE_HOME/kimi-jev.version containing that version so the
+Kimi-JevCompact plugin's doctor can detect prune support. Failures to write
+the marker are ignored: absence means "stock Kimi", never a crash.
+---
+ apps/kimi-code/src/main.ts             | 14 ++++++++++++++
+ apps/kimi-code/tsdown.native.config.ts |  4 +++-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/apps/kimi-code/src/main.ts b/apps/kimi-code/src/main.ts
+index f95d57c2a..e68855bc6 100644
+--- a/apps/kimi-code/src/main.ts
++++ b/apps/kimi-code/src/main.ts
+@@ -5,6 +5,9 @@
+  * outer update preflight, then delegates to the requested UI runner.
+  */
+ 
++import { writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++
+ import {
+   createKimiHarness,
+   flushDiagnosticLogs,
+@@ -64,6 +67,7 @@ export async function handleMainCommand(
+ ): Promise<MainCommandOutcome> {
+   let validated: ReturnType<typeof validateOptions>;
+   startupTrace('main:enter');
++  writeJevVersionMarker(version);
+   try {
+     validated = validateOptions(opts);
+   } catch (error) {
+@@ -301,6 +305,16 @@ function bootstrap(): void {
+ 
+ main();
+ 
++function writeJevVersionMarker(version: string): void {
++  try {
++    const markerDir = resolveKimiHome();
++    writeFileSync(join(markerDir, 'kimi-jev.version'), `${version}\n`, 'utf8');
++  } catch {
++    // Best-effort marker only; the plugin's doctor treats a missing marker as
++    // "stock Kimi", never as a crash.
++  }
++}
++
+ async function logStartupFailure(operation: string, error: unknown): Promise<void> {
+   log.error('startup failed', { operation, error });
+   try {
+diff --git a/apps/kimi-code/tsdown.native.config.ts b/apps/kimi-code/tsdown.native.config.ts
+index c1008cb61..4911dc762 100644
+--- a/apps/kimi-code/tsdown.native.config.ts
++++ b/apps/kimi-code/tsdown.native.config.ts
+@@ -48,7 +48,9 @@ export default defineConfig({
+   },
+   define: {
+     [BUILT_IN_CATALOG_DEFINE]: builtInCatalogDefine(),
+-    __KIMI_CODE_VERSION__: JSON.stringify(packageJson.version),
++    __KIMI_CODE_VERSION__: JSON.stringify(
++      `${packageJson.version}${process.env['KIMI_CODE_JEV_SUFFIX'] ?? ''}`,
++    ),
+     __KIMI_CODE_CHANNEL__: JSON.stringify(process.env['KIMI_CODE_CHANNEL'] ?? ''),
+     __KIMI_CODE_COMMIT__: JSON.stringify(process.env['KIMI_CODE_COMMIT'] ?? ''),
+     __KIMI_CODE_BUILD_TARGET__: JSON.stringify(buildTarget()),
+-- 
+2.56.0.windows.4
+

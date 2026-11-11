@@ -1,0 +1,24 @@
+# Weekly drift check: apply the patch series against the pinned upstream
+# commit in fork/upstream.lock. Catches bit-rot early without building.
+name: Fork patch drift
+
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Apply the patch series against the pinned upstream commit
+        run: bash fork/apply.sh --check

@@ -9,6 +9,55 @@ Kimi-JevCompact instead scores every tool call and tool result with TypeSafe's J
 fast request, drops or truncates the ones that are no longer needed, and keeps everything else
 word for word. User and assistant text is never rewritten.
 
+## Install
+
+Kimi-JevCompact is a standard Kimi plugin with one prerequisite: the patched
+`kimi-jev` build (the stock `kimi` binary ignores prune decisions — see
+[`fork/`](fork/README.md)). With `kimi-jev` on your PATH:
+
+1. `/plugins install https://github.com/kkaminsk/Kimi-JevCompact`
+2. Enable `kimi-jevcompact` in the plugin manager.
+3. `/reload`
+4. Put your TypeSafe API key in `$KIMI_CODE_HOME/kimi-jevcompact.json`:
+
+   ```json
+   { "apiKey": "YOUR_TYPESAFE_KEY" }
+   ```
+
+5. Check the wiring with `/kimi-jevcompact:doctor`, then run `/compact` and
+   `/kimi-jevcompact:status` to see the prune outcome.
+
+The managed copy under `$KIMI_CODE_HOME/plugins/managed/kimi-jevcompact/`
+contains the committed `dist/hook.mjs` bundle; no build or install step runs
+at install time.
+
+## Running the patched build
+
+The plugin needs a Kimi build that honours prune decisions. Stock `kimi`
+ignores them (the plugin's `/kimi-jevcompact:doctor` shows a failing
+prune-contract check there); the patched build installs as a separate
+`kimi-jev` binary and never touches the managed `kimi`.
+
+```sh
+bash fork/apply.sh   # clone upstream at the pinned commit, apply 0001-0004, test
+bash fork/build.sh   # SEA build; installs ~/.kimi-code/bin/kimi-jev
+kimi-jev --version   # 2.1.1+jev.1
+```
+
+- **Update** to a newer upstream: follow [`fork/rebase.md`](fork/rebase.md),
+  then re-run `apply.sh` and `build.sh`.
+- **Rollback**: delete `~/.kimi-code/bin/kimi-jev` and
+  `~/.kimi-code/kimi-jev.version`; the stock `kimi` was never modified.
+- **Sessions pruned by `kimi-jev` open only in `kimi-jev`** (the
+  `context.apply_prune` record is unknown to stock builds).
+- **Verify an install end to end** (spends real Jev credits):
+  `TYPESAFE_API_KEY=... bash fork/verify-e2e.sh`, or
+  `bash fork/verify-e2e.sh --expect-summary` with the plugin disabled to
+  confirm the summary fallback.
+
+To propose the contract upstream, see
+[`docs/upstream/feature-request.md`](docs/upstream/feature-request.md).
+
 ## Status
 
 Design phase. This repository currently holds a series of [OpenSpec](https://github.com/Fission-AI/OpenSpec)
