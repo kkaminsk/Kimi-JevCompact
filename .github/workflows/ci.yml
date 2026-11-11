@@ -107,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
     steps:
       # Always reports. docs/* branches short-circuit here and pass.
       - name: Decide whether this job applies

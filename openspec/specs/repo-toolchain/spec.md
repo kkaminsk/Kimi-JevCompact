@@ -46,7 +46,7 @@ The repository SHALL provide a single `npm run verify` that runs typecheck, unit
 #### Scenario: Continuous integration runs the same command
 
 - **WHEN** a pull request is opened
-- **THEN** the CI workflow runs `npm run verify` on Node 20 and Node 22 and reports the result on the pull request
+- **THEN** the CI workflow runs `npm run verify` on Node 22 and Node 24 and reports the result on the pull request
 
 ### Requirement: No secrets in version control
 

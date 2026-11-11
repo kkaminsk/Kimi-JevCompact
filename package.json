@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Verbatim, Jev-guided context compaction for Kimi Code CLI",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.18.0"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

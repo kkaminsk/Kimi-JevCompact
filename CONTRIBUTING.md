@@ -12,7 +12,7 @@ npm ci
 npm install -g @fission-ai/openspec
 ```
 
-Node 20 or newer runs the plugin's hook, the tests, and every npm script:
+The plugin's hook bundle runs under Node 20 or newer, while the repository toolchain (tests, build, every npm script) needs Node 22.18 or newer because tsdown requires it:
 
 ```text
 npm run typecheck    # tsc --noEmit over plugin/src
