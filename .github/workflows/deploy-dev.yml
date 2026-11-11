@@ -27,17 +27,15 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # {{SETUP_CMD}}
       - name: Setup
-        run: |
-          if [[ -f package.json ]]; then npm ci; else echo "no package.json yet (see openspec/changes/scaffold-kimi-jevcompact)"; fi
+        run: npm ci
 
       # {{BUILD_CMD}}
       - name: Build
-        run: |
-          if [[ -f package.json ]]; then npm run build; else echo "no package.json yet"; fi
+        run: npm run build
 
       # {{DEPLOY_DEV_CMD}}
       - name: Deploy to development

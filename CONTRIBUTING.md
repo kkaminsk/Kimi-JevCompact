@@ -8,17 +8,39 @@ in more detail.
 ```text
 git clone https://github.com/kkaminsk/Kimi-JevCompact.git
 cd Kimi-JevCompact
+npm ci
 npm install -g @fission-ai/openspec
 ```
 
-Node 20 or newer runs the plugin's hook and the tests. Building the patched
-Kimi binary from `fork/` needs Node 24.15 or newer and pnpm 10.33; that is
-documented in `fork/README.md` once the `fork-build-and-distribution` change
-lands. Once `package.json` exists, also run `npm ci`.
+The plugin's hook bundle runs under Node 20 or newer, while the repository toolchain (tests, build, every npm script) needs Node 22.18 or newer because tsdown requires it:
+
+```text
+npm run typecheck    # tsc --noEmit over plugin/src
+npm test             # vitest
+npm run build        # bundle plugin/src/hook.ts to plugin/dist/hook.mjs
+npm run verify       # typecheck + test + build + bundle isolation + openspec validate --all
+```
+
+Building the patched Kimi binary from `fork/` needs Node 24.15 or newer and
+pnpm 10.33; that is documented in `fork/README.md` once the
+`fork-build-and-distribution` change lands.
 
 Never commit a TypeSafe API key. It belongs in `$KIMI_CODE_HOME/kimi-jevcompact.json`
 or the `TYPESAFE_API_KEY` environment variable. `.gitignore` already covers the
 config file name.
+
+## Where each artefact lives
+
+| Path         | Contents                                                        |
+|--------------|-----------------------------------------------------------------|
+| `plugin/src` | TypeScript source of the PreCompact hook                        |
+| `plugin/dist`| Self-contained hook bundle produced by `npm run build`          |
+| `fork/`      | Patch series against the pinned upstream commit, apply/build scripts |
+| `docs/`      | Branching runbooks and Kimi Code research notes                 |
+| `openspec/`  | Specs and change proposals; `openspec/config.yaml` is the pin   |
+
+The fork patches and their upstream seams are described in
+[`docs/research/kimi-code-compaction-seams.md`](docs/research/kimi-code-compaction-seams.md).
 
 ## Where the work is
 

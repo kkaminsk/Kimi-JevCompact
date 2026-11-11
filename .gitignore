@@ -4,3 +4,6 @@ dist/
 .env
 *.local
 kimi-jevcompact.json
+plugin/dist/
+fork/build/
+
