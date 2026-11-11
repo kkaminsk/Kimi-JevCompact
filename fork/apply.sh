@@ -47,15 +47,24 @@ done
 
 echo "apply.sh: applied $(ls "$FORK_DIR"/patches/*.patch | wc -l | tr -d ' ') patch(es) on $sha"
 
+# corepack resolves the packageManager field from the caller's working
+# directory, not from --dir, so pass the upstream clone's pinned pnpm
+# explicitly (e.g. pnpm@10.33.0) instead of whatever pnpm is on PATH.
+pm_pin="$(node -p "require(process.argv[1]).packageManager" "$UPSTREAM_DIR/package.json" 2>/dev/null || true)"
+pnpm_cmd=(corepack pnpm)
+if [[ "$pm_pin" == pnpm@* ]]; then
+  pnpm_cmd=(corepack "$pm_pin")
+fi
+
 if [[ "$mode" == "--check" ]]; then
   echo "apply.sh: --check mode, skipping install and tests"
   exit 0
 fi
 
 echo "apply.sh: installing dependencies"
-corepack pnpm --dir "$UPSTREAM_DIR" install --frozen-lockfile
+"${pnpm_cmd[@]}" --dir "$UPSTREAM_DIR" install --frozen-lockfile
 
 echo "apply.sh: running agent-core-v2 tests"
-corepack pnpm --dir "$UPSTREAM_DIR" --filter @moonshot-ai/agent-core-v2 test
+"${pnpm_cmd[@]}" --dir "$UPSTREAM_DIR" --filter @moonshot-ai/agent-core-v2 test
 
 echo "apply.sh: ok"

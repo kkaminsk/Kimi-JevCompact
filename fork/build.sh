@@ -27,8 +27,17 @@ fi
 KIMI_CODE_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
 export KIMI_CODE_JEV_SUFFIX="+jev.${series}"
 
+# corepack resolves the packageManager field from the caller's working
+# directory, not from -C, so pass the upstream clone's pinned pnpm
+# explicitly (e.g. pnpm@10.33.0) instead of whatever pnpm is on PATH.
+pm_pin="$(node -p "require(process.argv[1]).packageManager" "$UPSTREAM_DIR/package.json" 2>/dev/null || true)"
+pnpm_cmd=(corepack pnpm)
+if [[ "$pm_pin" == pnpm@* ]]; then
+  pnpm_cmd=(corepack "$pm_pin")
+fi
+
 echo "build.sh: building kimi-jev ${version}${KIMI_CODE_JEV_SUFFIX}"
-corepack pnpm -C "$UPSTREAM_DIR/apps/kimi-code" build:native:sea --profile=local
+"${pnpm_cmd[@]}" -C "$UPSTREAM_DIR/apps/kimi-code" build:native:sea --profile=local
 
 triple="$(node -e "console.log(process.platform + '-' + process.arch)")"
 binary="$UPSTREAM_DIR/apps/kimi-code/dist-native/bin/${triple}/kimi"
