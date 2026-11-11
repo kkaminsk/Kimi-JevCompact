@@ -10,7 +10,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "build": "tsdown",
+    "build": "tsdown --config-loader native",
     "check:bundle": "node scripts/check-bundle.mjs",
     "verify": "npm run typecheck && npm test && npm run build && npm run check:bundle && openspec validate --all"
   },
