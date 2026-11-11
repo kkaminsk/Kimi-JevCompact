@@ -1,0 +1,5 @@
+# Pinned upstream Kimi Code commit that the patch series in patches/ applies to.
+# Read by fork/apply.sh (fork-build-and-distribution change).
+sha: b510fa9
+version: 2.1.1
+date: 2026-10-13
