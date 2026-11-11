@@ -104,6 +104,10 @@ jobs:
 
   build-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
     steps:
       # Always reports. docs/* branches short-circuit here and pass.
       - name: Decide whether this job applies
@@ -124,37 +128,19 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.gate.outputs.applicable == 'true'
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
 
-      # The npm scripts below are defined by the OpenSpec change
-      # scaffold-kimi-jevcompact. Until that change lands there is no
-      # package.json, so each step passes with a notice instead of failing
-      # every PR. Remove the guards once the manifest exists.
-
-      # {{SETUP_CMD}}
       - name: Setup
         if: steps.gate.outputs.applicable == 'true'
-        run: |
-          if [[ -f package.json ]]; then npm ci; else echo "no package.json yet (see openspec/changes/scaffold-kimi-jevcompact)"; fi
+        run: npm ci
 
-      # {{LINT_CMD}}
-      - name: Lint
+      - name: Verify
         if: steps.gate.outputs.applicable == 'true'
-        run: |
-          if [[ -f package.json ]]; then npm run typecheck; else echo "no package.json yet"; fi
+        run: npm run verify
 
-      # {{BUILD_CMD}}
-      - name: Build
+      - name: CI logic fixtures
         if: steps.gate.outputs.applicable == 'true'
-        run: |
-          if [[ -f package.json ]]; then npm run build; else echo "no package.json yet"; fi
-
-      # {{TEST_CMD}}
-      - name: Test
-        if: steps.gate.outputs.applicable == 'true'
-        run: |
-          if [[ -f package.json ]]; then npm test; else echo "no package.json yet"; fi
-          bash scripts/test-ci-logic.sh
+        run: bash scripts/test-ci-logic.sh
 
   docs-check:
     runs-on: ubuntu-latest

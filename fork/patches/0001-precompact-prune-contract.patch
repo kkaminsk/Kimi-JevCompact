@@ -1,0 +1,1226 @@
+From 4512ef71d95f0a6831d09f918fcb7cb6c30643af Mon Sep 17 00:00:00 2001
+From: Kevin Kaminski MVP <Kevin.Kaminski@bighatgroup.com>
+Date: Tue, 10 Nov 2026 13:58:34 -0600
+Subject: [PATCH] feat(external-hooks): let PreCompact hooks return a validated
+ prune decision
+
+The PreCompact payload now carries the agent history in a hook-safe
+projection (agent_id, max_context_tokens, instruction, and messages with
+per-entry text capped at 200 000 characters) so an external program can
+score the conversation. On exit 0 a hook may print
+hookSpecificOutput.compactionDecision "prune" with a prune object listing
+tool call ids to drop and tool results to truncate; the decision is
+validated against the live history (unknown ids, open tool exchanges,
+duplicate ids, and bad headChars are rejected and logged) and the first
+valid decision among parallel hooks is carried on the compaction task for
+the compaction service to apply. Existing hooks keep working: new fields
+are additive, malformed or absent output compacts as before, and exit code
+2 stays non-blocking. Docs (en and zh) describe the payload, the decision
+shape, and the validation rules.
+---
+ docs/en/customization/hooks.md                |  44 ++-
+ docs/zh/customization/hooks.md                |  44 ++-
+ .../agent/fullCompaction/fullCompaction.ts    |   4 +
+ .../fullCompaction/fullCompactionService.ts   |   6 +
+ .../agent/agentExternalHooksService.ts        |  45 ++-
+ .../externalHooks/internal/hookMessages.ts    |  58 ++++
+ .../externalHooks/internal/pruneDecision.ts   |  57 ++++
+ .../externalHooks/internal/runHook.ts         |  33 ++-
+ .../features/externalHooks/internal/types.ts  |  18 ++
+ .../test/agent/undo/undo.test.ts              |   1 +
+ .../externalHooks/hookMessages.test.ts        | 122 ++++++++
+ .../externalHooks/integration.test.ts         | 265 +++++++++++++++++-
+ .../externalHooks/pruneDecision.test.ts       | 126 +++++++++
+ .../features/externalHooks/runner.test.ts     |  69 +++++
+ 14 files changed, 885 insertions(+), 7 deletions(-)
+ create mode 100644 packages/agent-core-v2/src/features/externalHooks/internal/hookMessages.ts
+ create mode 100644 packages/agent-core-v2/src/features/externalHooks/internal/pruneDecision.ts
+ create mode 100644 packages/agent-core-v2/test/features/externalHooks/hookMessages.test.ts
+ create mode 100644 packages/agent-core-v2/test/features/externalHooks/pruneDecision.test.ts
+
+diff --git a/docs/en/customization/hooks.md b/docs/en/customization/hooks.md
+index 72ac0d77a..c3c1d1a80 100644
+--- a/docs/en/customization/hooks.md
++++ b/docs/en/customization/hooks.md
+@@ -124,10 +124,52 @@ Only **blockable events** (`PreToolUse`, `Stop`, `UserPromptSubmit`) have return
+ | `TaskStarted` | Task kind (`agent`, `process`, or `question`) | — | Triggered when a background task starts; payload includes `task_id`, `description`, `detached` |
+ | `StopFailure` | Error type | — | Triggered after the current turn fails due to an error |
+ | `Interrupt` | Empty string | — | Triggered when the user interrupts the turn (e.g. pressing Esc); not fired for timeouts or programmatic aborts; fires in place of `Stop`; payload includes `reason` |
+-| `PreCompact` | `manual` or `auto` | — | Triggered before context compaction begins; return values are completely ignored |
++| `PreCompact` | `manual` or `auto` | — | Triggered before context compaction begins; may return a prune decision (see [PreCompact prune decisions](#precompact-prune-decisions)) |
+ | `PostCompact` | `manual` or `auto` | — | Triggered after context compaction completes |
+ | `Notification` | Notification type (e.g. `task.completed`) | — | Triggered when a background task status changes |
+ 
++### PreCompact prune decisions
++
++`PreCompact` is the one observation-only event that can still influence the main flow: it receives the conversation history and may answer with a **prune decision** — a list of tool calls to drop and tool results to truncate, applied before compaction decides whether a summary is still needed. Everything else about the event (fail-open behaviour, timeout, working directory) stays the same.
++
++The payload adds the following fields on top of the base fields:
++
++| Field | Description |
++| --- | --- |
++| `trigger` | `manual` or `auto` |
++| `token_count` | Estimated tokens of the current context |
++| `agent_id` | Id of the agent whose context is about to be compacted |
++| `max_context_tokens` | Effective context window of the current model |
++| `instruction` | Free text passed to `/compact`; absent when none was given |
++| `messages` | The current context, oldest first; one entry per message |
++
++Each entry in `messages` has `index` (position in the context), `role` (`system`, `user`, `assistant`, or `tool`), `origin_kind` (the message origin when present), `text` (text parts only; thinking parts are excluded; capped at 200 000 characters with an omission note), `tool_calls` (assistant messages: array of `{ id, name, arguments }`, with `arguments` as the raw string), `tool_call_id` (tool messages), `is_error`, and `chars` (length of `text`).
++
++On exit code 0, the hook may print a JSON decision on stdout:
++
++```json
++{
++  "hookSpecificOutput": {
++    "compactionDecision": "prune",
++    "prune": {
++      "dropCalls": ["call_1", "call_2"],
++      "truncateResults": [{ "toolCallId": "call_3", "headChars": 300 }],
++      "note": "kept 41/58 messages"
++    }
++  }
++}
++```
++
++- `dropCalls`: ids of tool calls whose call and its result are both removed from the context.
++- `truncateResults`: tool results cut to their first `headChars` characters, with an omission note appended.
++- `note`: optional one-line explanation shown to the user.
++
++A decision is honoured only when every id exists in the history and its tool result has already arrived, no id appears in both lists, and `headChars` is a non-negative integer. Invalid decisions are ignored — the reason is logged — and compaction proceeds with the built-in behaviour. When several `PreCompact` hooks match, the first valid decision in configuration order wins and the rest are ignored. Empty stdout, `compactionDecision: "proceed"`, malformed JSON, or exit code 2 all mean "no prune": compaction runs exactly as it would without the hook.
++
++::: warning Note
++A prune never rewrites user or assistant text; it only removes tool calls and truncates tool results. The model can re-run a pruned tool when it needs the data again.
++:::
++
+ ## Example: Blocking Dangerous Shell Commands
+ 
+ The following hook checks the command content before the Agent calls the `Bash` tool and blocks it if `rm -rf` is detected:
+diff --git a/docs/zh/customization/hooks.md b/docs/zh/customization/hooks.md
+index 6ca70e94e..1a49c64a6 100644
+--- a/docs/zh/customization/hooks.md
++++ b/docs/zh/customization/hooks.md
+@@ -124,10 +124,52 @@ Hook 命令的工作目录是当前会话的项目目录。
+ | `TaskStarted` | 任务类型（`agent`、`process` 或 `question`） | — | 后台任务启动时触发；payload 含 `task_id`、`description`、`detached` |
+ | `StopFailure` | 错误类型 | — | 本轮因错误失败后触发 |
+ | `Interrupt` | 空字符串 | — | 用户中断本轮时触发（如按 Esc）；超时等程序性中断不触发，此时 `Stop` 由本事件替代；payload 含 `reason` |
+-| `PreCompact` | `manual` 或 `auto` | — | 上下文压缩开始前触发；返回值被完全忽略 |
++| `PreCompact` | `manual` 或 `auto` | — | 上下文压缩开始前触发；可以返回 prune 决策（见 [PreCompact prune 决策](#precompact-prune-决策)） |
+ | `PostCompact` | `manual` 或 `auto` | — | 上下文压缩完成后触发 |
+ | `Notification` | 通知类型（如 `task.completed`） | — | 后台任务状态变化时触发 |
+ 
++### PreCompact prune 决策
++
++`PreCompact` 是唯一仍能影响主流程的观察型事件：它会收到完整对话历史，并可以回答一个 **prune 决策** —— 一串要丢弃的工具调用和要截断的工具结果，在压缩决定是否还需要摘要之前生效。事件的其他行为（fail-open、超时、工作目录）保持不变。
++
++payload 在基础字段之上新增以下字段：
++
++| 字段 | 说明 |
++| --- | --- |
++| `trigger` | `manual` 或 `auto` |
++| `token_count` | 当前上下文的估算 token 数 |
++| `agent_id` | 即将被压缩的 agent 的 id |
++| `max_context_tokens` | 当前模型生效的上下文窗口 |
++| `instruction` | 传给 `/compact` 的自由文本；未提供时该字段不存在 |
++| `messages` | 当前上下文，最早的消息在前；每条消息一个条目 |
++
++`messages` 中的每个条目包含 `index`（在上下文中的位置）、`role`（`system`、`user`、`assistant` 或 `tool`）、`origin_kind`（消息来源，存在时）、`text`（仅文本部分，thinking 部分被排除，超过 200 000 字符时截断并附省略说明）、`tool_calls`（assistant 消息： `{ id, name, arguments }` 数组，`arguments` 为原始字符串）、`tool_call_id`（tool 消息）、`is_error` 和 `chars`（`text` 的长度）。
++
++退出码为 0 时，hook 可以通过 stdout 打印一个 JSON 决策：
++
++```json
++{
++  "hookSpecificOutput": {
++    "compactionDecision": "prune",
++    "prune": {
++      "dropCalls": ["call_1", "call_2"],
++      "truncateResults": [{ "toolCallId": "call_3", "headChars": 300 }],
++      "note": "kept 41/58 messages"
++    }
++  }
++}
++```
++
++- `dropCalls`：要从上下文中连同其结果一起移除的工具调用 id。
++- `truncateResults`：截断到前 `headChars` 个字符的工具结果，并附加省略说明。
++- `note`：可选的一行说明，展示给用户。
++
++只有当每个 id 都存在于历史中、其工具结果已经返回、没有 id 同时出现在两个列表中、且 `headChars` 是非负整数时，决策才会被采纳。无效决策会被忽略 —— 原因会写入日志 —— 压缩按内置行为继续。多个 `PreCompact` hook 同时匹配时，以配置顺序为准，第一个有效决策胜出，其余被忽略。空 stdout、`compactionDecision: "proceed"`、格式错误的 JSON 或退出码 2 都表示"不 prune"：压缩与不安装该 hook 时完全一致。
++
++::: warning 注意
++prune 永远不会改写用户或 assistant 的文本，只会移除工具调用、截断工具结果。模型需要数据时可以重新运行被 prune 的工具。
++:::
++
+ ## 示例：阻断危险 Shell 命令
+ 
+ 下面的 hook 在 Agent 调用 `Bash` 工具前检查命令内容，命中 `rm -rf` 时阻断：
+diff --git a/packages/agent-core-v2/src/agent/fullCompaction/fullCompaction.ts b/packages/agent-core-v2/src/agent/fullCompaction/fullCompaction.ts
+index 88c70d194..be83d0747 100644
+--- a/packages/agent-core-v2/src/agent/fullCompaction/fullCompaction.ts
++++ b/packages/agent-core-v2/src/agent/fullCompaction/fullCompaction.ts
+@@ -5,6 +5,7 @@ import type {
+ import { createDecorator } from "#/_base/di/instantiation";
+ import type { Event } from '#/_base/event';
+ import type { Hooks } from '#/hooks';
++import type { ValidatedPruneDecision } from '#/features/externalHooks/internal/types';
+ 
+ export interface FullCompactionInput {
+   readonly source: CompactionSource;
+@@ -16,7 +17,10 @@ export interface FullCompactionTask {
+   readonly promise: Promise<CompactionResult>;
+   readonly trigger: CompactionSource;
+   readonly tokenCount: number;
++  readonly instruction?: string;
++  readonly maxContextTokens: number;
+   readonly traceId?: string;
++  pruneDecision?: ValidatedPruneDecision;
+ }
+ 
+ export interface IAgentFullCompactionService {
+diff --git a/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts b/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts
+index 5b3c7a115..514dff0b3 100644
+--- a/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts
++++ b/packages/agent-core-v2/src/agent/fullCompaction/fullCompactionService.ts
+@@ -353,6 +353,8 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+       const active = this.createActiveCompaction(
+         data.source,
+         tokenCount,
++        data.instruction,
++        this.getEffectiveMaxContextTokens(),
+         data.source === 'auto' ? this.activeTurnId : undefined,
+         quiescence,
+       );
+@@ -397,6 +399,8 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+   private createActiveCompaction(
+     trigger: CompactionBeginData['source'],
+     tokenCount: number,
++    instruction: string | undefined,
++    maxContextTokens: number,
+     originTurnId: number | undefined,
+     quiescence: IDisposable | undefined,
+   ): {
+@@ -417,6 +421,8 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
+         promise,
+         trigger,
+         tokenCount,
++        instruction,
++        maxContextTokens,
+         originTurnId,
+         quiescence,
+         get traceId() {
+diff --git a/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts b/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts
+index ec7e11b86..d061643f1 100644
+--- a/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts
++++ b/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts
+@@ -33,10 +33,17 @@ import { toKimiErrorPayload } from '#/errors';
+ import { ISessionContext } from '#/session/sessionContext/sessionContext';
+ import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
+ import { IEventDispatcher } from '#/state/eventDispatcher';
++import { ILogService } from '#/_base/log/log';
+ 
+ import { IAgentExternalHooksService } from './agentExternalHooks';
+ import { IExternalHooksRunnerService } from '../app/externalHooksRunner';
+-import type { HookMatcherValue } from '../internal/types';
++import type {
++  HookMatcherValue,
++  HookResult as HookRunResult,
++  ValidatedPruneDecision,
++} from '../internal/types';
++import { toHookMessages, type HookMessage } from '../internal/hookMessages';
++import { validatePruneDecision } from '../internal/pruneDecision';
+ import {
+   renderUserPromptHookBlockResult,
+   renderUserPromptHookResult,
+@@ -78,6 +85,7 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
+     @IAgentStateService private readonly states: IAgentStateService,
+     @IAgentScopeContext private readonly scopeContext: IAgentScopeContext,
+     @IEventDispatcher private readonly dispatcher: IEventDispatcher,
++    @ILogService private readonly log: ILogService,
+   ) {
+     super();
+     this.states.contributeState(externalHooksStopHookContinuationUsedKey);
+@@ -422,16 +430,49 @@ export class AgentExternalHooksService extends Service implements IAgentExternal
+   private async runPreCompact(ctx: FullCompactionTask): Promise<void> {
+     const signal = ctx.abortController.signal;
+     signal.throwIfAborted();
+-    await this.runner.trigger('PreCompact', {
++    const messages = toHookMessages(this.context.get());
++    const results = await this.runner.trigger('PreCompact', {
+       matcherValue: ctx.trigger,
+       signal,
+       sessionId: this.sessionContext.sessionId,
+       inputData: this.withSessionFacts({
+         trigger: ctx.trigger,
+         tokenCount: ctx.tokenCount,
++        agent_id: this.scopeContext.agentId,
++        max_context_tokens: ctx.maxContextTokens,
++        instruction: ctx.instruction,
++        messages,
+       }),
+     });
+     signal.throwIfAborted();
++    const decision = this.pickPruneDecision(results, messages);
++    if (decision !== undefined) {
++      ctx.pruneDecision = decision;
++    }
++  }
++
++  private pickPruneDecision(
++    results: readonly HookRunResult[],
++    messages: readonly HookMessage[],
++  ): ValidatedPruneDecision | undefined {
++    let picked: ValidatedPruneDecision | undefined;
++    for (const result of results) {
++      const raw = result.pruneDecision;
++      if (raw === undefined) continue;
++      const validation = validatePruneDecision(raw, messages);
++      if (!validation.ok) {
++        this.log.warn('precompact prune decision rejected', { reason: validation.reason });
++        continue;
++      }
++      if (picked !== undefined) {
++        this.log.warn('precompact prune decision ignored', {
++          reason: 'an earlier hook already returned a valid prune decision',
++        });
++        continue;
++      }
++      picked = validation.decision;
++    }
++    return picked;
+   }
+ 
+   private notifyPostCompact(ctx: FullCompactionTask, result: CompactionResult): void {
+diff --git a/packages/agent-core-v2/src/features/externalHooks/internal/hookMessages.ts b/packages/agent-core-v2/src/features/externalHooks/internal/hookMessages.ts
+new file mode 100644
+index 000000000..e64121cd5
+--- /dev/null
++++ b/packages/agent-core-v2/src/features/externalHooks/internal/hookMessages.ts
+@@ -0,0 +1,58 @@
++import type { ContextMessage } from '#/agent/contextMemory/types';
++
++export const HOOK_MESSAGE_TEXT_CAP = 200_000;
++
++export interface HookToolCallRef {
++  readonly id: string;
++  readonly name: string;
++  readonly arguments: string;
++}
++
++export interface HookMessage {
++  readonly index: number;
++  readonly role: 'system' | 'user' | 'assistant' | 'tool';
++  readonly origin_kind?: string;
++  readonly text: string;
++  readonly tool_calls?: readonly HookToolCallRef[];
++  readonly tool_call_id?: string;
++  readonly is_error: boolean;
++  readonly chars: number;
++}
++
++export function toHookMessages(history: readonly ContextMessage[]): HookMessage[] {
++  return history.map((message, index) => toHookMessage(message, index));
++}
++
++function toHookMessage(message: ContextMessage, index: number): HookMessage {
++  const text = capHookText(
++    message.content
++      .filter((part) => part.type === 'text')
++      .map((part) => part.text)
++      .join(''),
++  );
++  const toolCalls =
++    message.role === 'assistant' && message.toolCalls.length > 0
++      ? message.toolCalls.map((call) => ({
++          id: call.id,
++          name: call.name,
++          arguments: call.arguments ?? '',
++        }))
++      : undefined;
++  const toolCallId = message.role === 'tool' ? message.toolCallId : undefined;
++  return {
++    index,
++    role: message.role,
++    origin_kind: message.origin?.kind,
++    text,
++    tool_calls: toolCalls,
++    tool_call_id: toolCallId,
++    is_error: message.isError === true,
++    chars: text.length,
++  };
++}
++
++function capHookText(text: string): string {
++  if (text.length <= HOOK_MESSAGE_TEXT_CAP) return text;
++  const omitted = text.length - HOOK_MESSAGE_TEXT_CAP;
++  return `${text.slice(0, HOOK_MESSAGE_TEXT_CAP)}[… ${String(omitted)} chars omitted …]`;
++}
+diff --git a/packages/agent-core-v2/src/features/externalHooks/internal/pruneDecision.ts b/packages/agent-core-v2/src/features/externalHooks/internal/pruneDecision.ts
+new file mode 100644
+index 000000000..0637628cc
+--- /dev/null
++++ b/packages/agent-core-v2/src/features/externalHooks/internal/pruneDecision.ts
+@@ -0,0 +1,57 @@
++import type { HookMessage } from './hookMessages';
++import type { RawPruneDecision, ValidatedPruneDecision } from './types';
++
++export type PruneDecisionValidation =
++  | { readonly ok: true; readonly decision: ValidatedPruneDecision }
++  | { readonly ok: false; readonly reason: string };
++
++export function validatePruneDecision(
++  raw: RawPruneDecision,
++  messages: readonly HookMessage[],
++): PruneDecisionValidation {
++  const callIds = new Set<string>();
++  const resultIds = new Set<string>();
++  for (const message of messages) {
++    for (const call of message.tool_calls ?? []) {
++      callIds.add(call.id);
++    }
++    if (message.tool_call_id !== undefined) {
++      resultIds.add(message.tool_call_id);
++    }
++  }
++
++  const seen = new Set<string>();
++  for (const id of raw.dropCalls) {
++    const rejection = rejectId(id, callIds, resultIds, seen);
++    if (rejection !== undefined) return { ok: false, reason: rejection };
++    seen.add(id);
++  }
++
++  const truncateResults: { readonly toolCallId: string; readonly headChars: number }[] = [];
++  for (const truncate of raw.truncateResults) {
++    if (!Number.isInteger(truncate.headChars) || truncate.headChars < 0) {
++      return { ok: false, reason: `bad headChars for id "${truncate.toolCallId}"` };
++    }
++    const rejection = rejectId(truncate.toolCallId, callIds, resultIds, seen);
++    if (rejection !== undefined) return { ok: false, reason: rejection };
++    seen.add(truncate.toolCallId);
++    truncateResults.push({ toolCallId: truncate.toolCallId, headChars: truncate.headChars });
++  }
++
++  return {
++    ok: true,
++    decision: { dropCalls: [...raw.dropCalls], truncateResults, note: raw.note },
++  };
++}
++
++function rejectId(
++  id: string,
++  callIds: ReadonlySet<string>,
++  resultIds: ReadonlySet<string>,
++  seen: ReadonlySet<string>,
++): string | undefined {
++  if (seen.has(id)) return `duplicate id "${id}"`;
++  if (!callIds.has(id)) return `unknown tool call id "${id}"`;
++  if (!resultIds.has(id)) return `open tool exchange for id "${id}"`;
++  return undefined;
++}
+diff --git a/packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts b/packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts
+index 59a023aba..7875c0941 100644
+--- a/packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts
++++ b/packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts
+@@ -4,7 +4,7 @@ import { z } from 'zod';
+ 
+ import { type IHostProcess, IHostProcessService } from '#/os/interface/hostProcess';
+ 
+-import type { HookResult } from './types';
++import type { HookResult, RawPruneDecision } from './types';
+ 
+ export interface RunHookOptions {
+   readonly timeout: number;
+@@ -40,6 +40,15 @@ const OptionalStringSchema = z.preprocess(
+   },
+   z.string().optional(),
+ );
++const HookPruneTruncateSchema = z.looseObject({
++  toolCallId: z.string(),
++  headChars: z.number().int().nonnegative(),
++});
++const HookPruneSchema = z.looseObject({
++  dropCalls: z.array(z.string()),
++  truncateResults: z.array(HookPruneTruncateSchema),
++  note: z.string().optional(),
++});
+ const HookSpecificOutputSchema = z.preprocess(
+   (value) => (isRecord(value) ? value : undefined),
+   z
+@@ -47,6 +56,8 @@ const HookSpecificOutputSchema = z.preprocess(
+       message: OptionalStringSchema,
+       permissionDecision: z.unknown().optional(),
+       permissionDecisionReason: z.unknown().optional(),
++      compactionDecision: z.enum(['prune', 'proceed']).optional(),
++      prune: HookPruneSchema.optional(),
+     })
+     .optional(),
+ );
+@@ -160,6 +171,7 @@ function resultFromExitCode(exitCode: number, stdout: string, stderr: string): H
+       stderr,
+       exitCode,
+       structuredOutput: structured.structuredOutput,
++      pruneDecision: structured.pruneDecision,
+     };
+   }
+ 
+@@ -169,12 +181,21 @@ function resultFromExitCode(exitCode: number, stdout: string, stderr: string): H
+     stderr,
+     exitCode,
+     structuredOutput: structured?.structuredOutput,
++    pruneDecision: structured?.pruneDecision,
+   });
+ }
+ 
+ function structuredOutput(
+   stdout: string,
+-): { action?: 'block'; reason?: string; message?: string; structuredOutput: true } | undefined {
++):
++  | {
++      action?: 'block';
++      reason?: string;
++      message?: string;
++      structuredOutput: true;
++      pruneDecision?: RawPruneDecision;
++    }
++  | undefined {
+   const text = stdout.trim();
+   if (text.length === 0) return undefined;
+ 
+@@ -184,9 +205,14 @@ function structuredOutput(
+     if (!output.success) return undefined;
+ 
+     const { message, hookSpecificOutput } = output.data;
++    const pruneDecision =
++      hookSpecificOutput?.compactionDecision === 'prune'
++        ? hookSpecificOutput.prune
++        : undefined;
+     const result = {
+       message: message ?? hookSpecificOutput?.message,
+       structuredOutput: true as const,
++      pruneDecision,
+     };
+     if (hookSpecificOutput?.permissionDecision !== 'deny') {
+       return result;
+@@ -199,6 +225,7 @@ function structuredOutput(
+           ? hookSpecificOutput.permissionDecisionReason
+           : undefined,
+       structuredOutput: true as const,
++      pruneDecision,
+     };
+   } catch {
+     return undefined;
+@@ -213,6 +240,7 @@ function allowResult(input: {
+   readonly timedOut?: boolean;
+   readonly errored?: boolean;
+   readonly structuredOutput?: boolean;
++  readonly pruneDecision?: RawPruneDecision;
+ }): HookResult {
+   return {
+     action: 'allow',
+@@ -223,6 +251,7 @@ function allowResult(input: {
+     timedOut: input.timedOut,
+     errored: input.errored,
+     structuredOutput: input.structuredOutput,
++    pruneDecision: input.pruneDecision,
+   };
+ }
+ 
+diff --git a/packages/agent-core-v2/src/features/externalHooks/internal/types.ts b/packages/agent-core-v2/src/features/externalHooks/internal/types.ts
+index 15429b84c..877bf354f 100644
+--- a/packages/agent-core-v2/src/features/externalHooks/internal/types.ts
++++ b/packages/agent-core-v2/src/features/externalHooks/internal/types.ts
+@@ -34,6 +34,23 @@ export interface HookDef {
+   readonly env?: Record<string, string>;
+ }
+ 
++export interface RawPruneTruncate {
++  readonly toolCallId: string;
++  readonly headChars: number;
++}
++
++export interface RawPruneDecision {
++  readonly dropCalls: readonly string[];
++  readonly truncateResults: readonly RawPruneTruncate[];
++  readonly note?: string;
++}
++
++export interface ValidatedPruneDecision {
++  readonly dropCalls: readonly string[];
++  readonly truncateResults: readonly RawPruneTruncate[];
++  readonly note?: string;
++}
++
+ export interface HookResult {
+   readonly action: 'allow' | 'block';
+   readonly message?: string;
+@@ -44,6 +61,7 @@ export interface HookResult {
+   readonly timedOut?: boolean;
+   readonly errored?: boolean;
+   readonly structuredOutput?: boolean;
++  readonly pruneDecision?: RawPruneDecision;
+ }
+ 
+ export interface HookBlockDecision {
+diff --git a/packages/agent-core-v2/test/agent/undo/undo.test.ts b/packages/agent-core-v2/test/agent/undo/undo.test.ts
+index f8590268d..ded0f07cb 100644
+--- a/packages/agent-core-v2/test/agent/undo/undo.test.ts
++++ b/packages/agent-core-v2/test/agent/undo/undo.test.ts
+@@ -194,6 +194,7 @@ describe('AgentConversationUndoService', () => {
+       promise: new Promise<never>(() => {}),
+       trigger: 'manual',
+       tokenCount: 2,
++      maxContextTokens: 1024,
+     });
+ 
+     try {
+diff --git a/packages/agent-core-v2/test/features/externalHooks/hookMessages.test.ts b/packages/agent-core-v2/test/features/externalHooks/hookMessages.test.ts
+new file mode 100644
+index 000000000..87d5879e6
+--- /dev/null
++++ b/packages/agent-core-v2/test/features/externalHooks/hookMessages.test.ts
+@@ -0,0 +1,122 @@
++import { describe, expect, it } from 'vitest';
++
++import type { ContextMessage } from '#/agent/contextMemory/types';
++import { HOOK_MESSAGE_TEXT_CAP, toHookMessages } from '#/features/externalHooks/internal/hookMessages';
++
++function userMessage(text: string): ContextMessage {
++  return { role: 'user', content: [{ type: 'text', text }], toolCalls: [] };
++}
++
++describe('toHookMessages', () => {
++  it('projects user, assistant, tool, and system messages with index, role, and text', () => {
++    const history: ContextMessage[] = [
++      { role: 'system', content: [{ type: 'text', text: 'sys' }], toolCalls: [] },
++      userMessage('hello'),
++      {
++        role: 'assistant',
++        content: [{ type: 'text', text: 'working on it' }],
++        toolCalls: [
++          { type: 'function', id: 'c1', name: 'Read', arguments: '{"path":"a"}' },
++          { type: 'function', id: 'c2', name: 'Bash', arguments: null },
++        ],
++      },
++      { role: 'tool', content: [{ type: 'text', text: 'file a' }], toolCalls: [], toolCallId: 'c1' },
++    ];
++
++    const messages = toHookMessages(history);
++
++    expect(messages.map((message) => message.role)).toEqual([
++      'system',
++      'user',
++      'assistant',
++      'tool',
++    ]);
++    expect(messages.map((message) => message.index)).toEqual([0, 1, 2, 3]);
++    expect(messages[1]?.text).toBe('hello');
++    expect(messages[1]?.chars).toBe('hello'.length);
++    expect(messages[1]?.is_error).toBe(false);
++    expect(messages[3]?.tool_call_id).toBe('c1');
++  });
++
++  it('carries tool calls with raw argument strings', () => {
++    const history: ContextMessage[] = [
++      {
++        role: 'assistant',
++        content: [{ type: 'text', text: '' }],
++        toolCalls: [
++          { type: 'function', id: 'c1', name: 'Read', arguments: '{"path":"a"}' },
++          { type: 'function', id: 'c2', name: 'Bash', arguments: null },
++        ],
++      },
++    ];
++
++    const messages = toHookMessages(history);
++
++    expect(messages[0]?.tool_calls).toEqual([
++      { id: 'c1', name: 'Read', arguments: '{"path":"a"}' },
++      { id: 'c2', name: 'Bash', arguments: '' },
++    ]);
++  });
++
++  it('excludes thinking parts from the projected text', () => {
++    const history: ContextMessage[] = [
++      {
++        role: 'assistant',
++        content: [
++          { type: 'think', think: 'hidden reasoning' },
++          { type: 'text', text: 'visible answer' },
++        ],
++        toolCalls: [],
++      },
++    ];
++
++    const messages = toHookMessages(history);
++
++    expect(messages[0]?.text).toBe('visible answer');
++    expect(messages[0]?.chars).toBe('visible answer'.length);
++  });
++
++  it('carries the message origin kind when present', () => {
++    const history: ContextMessage[] = [
++      {
++        ...userMessage('summary'),
++        origin: { kind: 'compaction_summary' },
++      },
++    ];
++
++    const messages = toHookMessages(history);
++
++    expect(messages[0]?.origin_kind).toBe('compaction_summary');
++  });
++
++  it('marks errored tool messages', () => {
++    const history: ContextMessage[] = [
++      {
++        role: 'tool',
++        content: [{ type: 'text', text: 'boom' }],
++        toolCalls: [],
++        toolCallId: 'c9',
++        isError: true,
++      },
++    ];
++
++    const messages = toHookMessages(history);
++
++    expect(messages[0]?.is_error).toBe(true);
++  });
++
++  it('caps oversized text and leaves the source message untouched', () => {
++    const big = 'x'.repeat(HOOK_MESSAGE_TEXT_CAP * 2 + 700);
++    const history: ContextMessage[] = [userMessage(big)];
++
++    const messages = toHookMessages(history);
++
++    const expectedNote = `[… ${String(big.length - HOOK_MESSAGE_TEXT_CAP)} chars omitted …]`;
++    expect(messages[0]?.text).toBe(big.slice(0, HOOK_MESSAGE_TEXT_CAP) + expectedNote);
++    expect(messages[0]?.chars).toBe(messages[0]?.text.length);
++    expect(history[0]?.content[0]?.type).toBe('text');
++    if (history[0]?.content[0]?.type === 'text') {
++      expect(history[0].content[0].text).toBe(big);
++    }
++  });
++});
+diff --git a/packages/agent-core-v2/test/features/externalHooks/integration.test.ts b/packages/agent-core-v2/test/features/externalHooks/integration.test.ts
+index 69d64f8db..977caf5c8 100644
+--- a/packages/agent-core-v2/test/features/externalHooks/integration.test.ts
++++ b/packages/agent-core-v2/test/features/externalHooks/integration.test.ts
+@@ -29,7 +29,8 @@ import {
+ } from '#/features/externalHooks/configSection';
+ import { IAgentExternalHooksService } from '#/features/externalHooks/agent/agentExternalHooks';
+ import { AgentExternalHooksService } from '#/features/externalHooks/agent/agentExternalHooksService';
+-import { IAgentFullCompactionService } from '#/agent/fullCompaction/fullCompaction';
++import { IAgentFullCompactionService, type FullCompactionTask } from '#/agent/fullCompaction/fullCompaction';
++import type { CompactionResult } from '#/agent/fullCompaction/types';
+ import {
+   IAgentScopeContext,
+   makeAgentScopeContext,
+@@ -47,6 +48,7 @@ import {
+ } from '#/agent/toolApproval/toolApprovalService';
+ import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
+ import { IExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunner';
++import type { HookResult } from '#/features/externalHooks/internal/types';
+ import { ExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunnerService';
+ import { makeHookRunner } from './runner-stub';
+ import type { AgentTaskInfo } from '#/agent/task/task';
+@@ -68,6 +70,7 @@ import {
+ import { createHooks, OrderedHookSlot } from '#/hooks';
+ import { ISessionContext } from '#/session/sessionContext/sessionContext';
+ import { IEventDispatcher } from '#/state/eventDispatcher';
++import { ILogService, type ILogger, type LogPayload } from '#/_base/log/log';
+ import {
+   type AgentTaskHooks,
+   type AgentTaskStopHookContext,
+@@ -256,6 +259,27 @@ function stubSessionLifecycle() {
+   };
+ }
+ 
++const logWarnings: { readonly message: string; readonly payload?: LogPayload }[] = [];
++
++function stubLogService(): ILogService {
++  const logger: ILogger = {
++    error: () => {},
++    warn: (message: string, payload?: LogPayload) => {
++      logWarnings.push({ message, payload });
++    },
++    info: () => {},
++    debug: () => {},
++    child: () => logger,
++  };
++  return {
++    _serviceBrand: undefined,
++    level: 'off',
++    setLevel: () => {},
++    flush: async () => {},
++    ...logger,
++  };
++}
++
+ function registerAgentEventBus(reg: ServiceRegistration): void {
+   reg.defineInstance(
+     IAgentScopeContext,
+@@ -267,6 +291,7 @@ function registerAgentEventBus(reg: ServiceRegistration): void {
+   );
+   reg.define(ISessionEventBus, EventBusService);
+   reg.define(IEventBus, AgentEventBusView);
++  reg.defineInstance(ILogService, stubLogService());
+ }
+ 
+ function activateAgentEventBus(ix: TestInstantiationService): IEventBus {
+@@ -1450,3 +1475,241 @@ describe('IExternalHooksRunnerService integration', () => {
+     }
+   });
+ });
++
++describe('PreCompact prune contract', () => {
++  interface PreCompactHarness {
++    readonly ix: TestInstantiationService;
++    readonly context: ReturnType<typeof stubContextMemory>;
++    readonly triggerCalls: { readonly event: string; readonly inputData: Record<string, unknown> }[];
++    setTriggerResults(results: readonly HookResult[]): void;
++  }
++
++  function installPreCompactHarness(disposables: DisposableStore): PreCompactHarness {
++    logWarnings.length = 0;
++    const context = stubContextMemory();
++    const triggerCalls: PreCompactHarness['triggerCalls'] = [];
++    let triggerResults: readonly HookResult[] = [];
++    const ix = createServices(disposables, {
++      strict: true,
++      additionalServices: (reg) => {
++        registerStateServices(reg);
++        registerTestAgentWireServices(reg, 'wire/external-hooks');
++        reg.defineInstance(IBootstrapService, stubBootstrap());
++        reg.defineInstance(ISessionContext, stubSessionContext());
++        reg.defineInstance(ISessionMetadata, stubSessionMetadata());
++        reg.definePartialInstance(IConfigService, {});
++        reg.definePartialInstance(IPluginService, {});
++        reg.defineInstance(IAgentContextMemoryService, context);
++        reg.defineInstance(IAgentLoopService, stubLoopWithHooks());
++        registerAgentEventBus(reg);
++        reg.defineInstance(IAgentToolExecutorService, stubToolExecutor());
++        reg.definePartialInstance(IAgentPermissionGate, {});
++        reg.definePartialInstance(IAgentFullCompactionService, {
++          hooks: createHooks(['onWillCompact']),
++        });
++        reg.definePartialInstance(IAgentTaskService, {});
++      },
++    });
++    activateAgentEventBus(ix);
++    ix.set(
++      IExternalHooksRunnerService,
++      stubHookRunner({
++        trigger: async (event: string, args: { inputData: Record<string, unknown> }) => {
++          triggerCalls.push({ event, inputData: args.inputData });
++          return [...triggerResults];
++        },
++      }),
++    );
++    ix.set(IAgentExternalHooksService, new SyncDescriptor(AgentExternalHooksService));
++    ix.get(IAgentExternalHooksService);
++    return {
++      ix,
++      context,
++      triggerCalls,
++      setTriggerResults: (results) => {
++        triggerResults = results;
++      },
++    };
++  }
++
++  function seedExchanges(context: ReturnType<typeof stubContextMemory>): void {
++    context.append(
++      { role: 'user', content: [{ type: 'text', text: 'read these files' }], toolCalls: [] },
++      {
++        role: 'assistant',
++        content: [{ type: 'text', text: 'reading now' }],
++        toolCalls: [
++          { type: 'function', id: 'c1', name: 'Read', arguments: '{"path":"a"}' },
++          { type: 'function', id: 'c2', name: 'Read', arguments: '{"path":"b"}' },
++        ],
++      },
++      {
++        role: 'tool',
++        content: [{ type: 'text', text: 'contents a' }],
++        toolCalls: [],
++        toolCallId: 'c1',
++      },
++      {
++        role: 'tool',
++        content: [{ type: 'text', text: 'contents b' }],
++        toolCalls: [],
++        toolCallId: 'c2',
++      },
++    );
++  }
++
++  function makeCompactionTask(instruction?: string): FullCompactionTask {
++    return {
++      abortController: new AbortController(),
++      promise: Promise.resolve({} as CompactionResult),
++      trigger: 'manual',
++      tokenCount: 42,
++      instruction,
++      maxContextTokens: 200_000,
++    };
++  }
++
++  it('extends the PreCompact payload with agent id, max context tokens, instruction, and messages', async () => {
++    const disposables = new DisposableStore();
++    const harness = installPreCompactHarness(disposables);
++    try {
++      seedExchanges(harness.context);
++      const task = makeCompactionTask('keep only the plan');
++
++      await harness.ix.get(IAgentFullCompactionService).hooks.onWillCompact.run(task);
++
++      expect(harness.triggerCalls).toHaveLength(1);
++      expect(harness.triggerCalls[0]?.event).toBe('PreCompact');
++      const inputData = harness.triggerCalls[0]?.inputData ?? {};
++      expect(inputData).toEqual(
++        expect.objectContaining({
++          trigger: 'manual',
++          tokenCount: 42,
++          agent_id: 'main',
++          max_context_tokens: 200_000,
++          instruction: 'keep only the plan',
++        }),
++      );
++      const messages = inputData['messages'] as Array<Record<string, unknown>>;
++      expect(messages).toHaveLength(4);
++      expect(messages[1]?.['tool_calls']).toEqual([
++        { id: 'c1', name: 'Read', arguments: '{"path":"a"}' },
++        { id: 'c2', name: 'Read', arguments: '{"path":"b"}' },
++      ]);
++      expect(messages[2]).toEqual(
++        expect.objectContaining({ role: 'tool', tool_call_id: 'c1', text: 'contents a' }),
++      );
++      expect(task.pruneDecision).toBeUndefined();
++    } finally {
++      harness.ix.dispose();
++      disposables.dispose();
++    }
++  });
++
++  it('omits the instruction field when none was given', async () => {
++    const disposables = new DisposableStore();
++    const harness = installPreCompactHarness(disposables);
++    try {
++      seedExchanges(harness.context);
++      const task = makeCompactionTask();
++
++      await harness.ix.get(IAgentFullCompactionService).hooks.onWillCompact.run(task);
++
++      const inputData = harness.triggerCalls[0]?.inputData ?? {};
++      expect(inputData.instruction).toBeUndefined();
++    } finally {
++      harness.ix.dispose();
++      disposables.dispose();
++    }
++  });
++
++  it('applies a valid prune decision to the compaction task', async () => {
++    const disposables = new DisposableStore();
++    const harness = installPreCompactHarness(disposables);
++    try {
++      seedExchanges(harness.context);
++      harness.setTriggerResults([
++        {
++          action: 'allow',
++          pruneDecision: {
++            dropCalls: ['c1'],
++            truncateResults: [{ toolCallId: 'c2', headChars: 300 }],
++            note: 'kept 3/4',
++          },
++        },
++      ]);
++      const task = makeCompactionTask();
++
++      await harness.ix.get(IAgentFullCompactionService).hooks.onWillCompact.run(task);
++
++      expect(task.pruneDecision).toEqual({
++        dropCalls: ['c1'],
++        truncateResults: [{ toolCallId: 'c2', headChars: 300 }],
++        note: 'kept 3/4',
++      });
++    } finally {
++      harness.ix.dispose();
++      disposables.dispose();
++    }
++  });
++
++  it('rejects an invalid decision, logs the reason, and leaves the task unset', async () => {
++    const disposables = new DisposableStore();
++    const harness = installPreCompactHarness(disposables);
++    try {
++      seedExchanges(harness.context);
++      harness.setTriggerResults([
++        { action: 'allow', pruneDecision: { dropCalls: ['missing'], truncateResults: [] } },
++      ]);
++      const task = makeCompactionTask();
++
++      await harness.ix.get(IAgentFullCompactionService).hooks.onWillCompact.run(task);
++
++      expect(task.pruneDecision).toBeUndefined();
++      expect(logWarnings).toEqual([
++        expect.objectContaining({ message: 'precompact prune decision rejected' }),
++      ]);
++      expect(logWarnings[0]?.payload).toEqual(
++        expect.objectContaining({ reason: expect.stringContaining('unknown tool call id') }),
++      );
++    } finally {
++      harness.ix.dispose();
++      disposables.dispose();
++    }
++  });
++
++  it('uses the first valid decision and logs later ones as ignored', async () => {
++    const disposables = new DisposableStore();
++    const harness = installPreCompactHarness(disposables);
++    try {
++      seedExchanges(harness.context);
++      harness.setTriggerResults([
++        { action: 'allow', pruneDecision: { dropCalls: ['missing'], truncateResults: [] } },
++        {
++          action: 'allow',
++          pruneDecision: { dropCalls: ['c1'], truncateResults: [], note: 'first' },
++        },
++        {
++          action: 'allow',
++          pruneDecision: { dropCalls: ['c2'], truncateResults: [], note: 'second' },
++        },
++      ]);
++      const task = makeCompactionTask();
++
++      await harness.ix.get(IAgentFullCompactionService).hooks.onWillCompact.run(task);
++
++      expect(task.pruneDecision).toEqual({
++        dropCalls: ['c1'],
++        truncateResults: [],
++        note: 'first',
++      });
++      expect(logWarnings.map((entry) => entry.message)).toEqual([
++        'precompact prune decision rejected',
++        'precompact prune decision ignored',
++      ]);
++    } finally {
++      harness.ix.dispose();
++      disposables.dispose();
++    }
++  });
++});
+diff --git a/packages/agent-core-v2/test/features/externalHooks/pruneDecision.test.ts b/packages/agent-core-v2/test/features/externalHooks/pruneDecision.test.ts
+new file mode 100644
+index 000000000..3eadb2f33
+--- /dev/null
++++ b/packages/agent-core-v2/test/features/externalHooks/pruneDecision.test.ts
+@@ -0,0 +1,126 @@
++import { describe, expect, it } from 'vitest';
++
++import type { HookMessage } from '#/features/externalHooks/internal/hookMessages';
++import { validatePruneDecision } from '#/features/externalHooks/internal/pruneDecision';
++import type { RawPruneDecision } from '#/features/externalHooks/internal/types';
++
++function historyWithExchanges(...ids: readonly string[]): HookMessage[] {
++  return [
++    { index: 0, role: 'user', text: 'prompt', is_error: false, chars: 6 },
++    {
++      index: 1,
++      role: 'assistant',
++      text: '',
++      is_error: false,
++      chars: 0,
++      tool_calls: ids.map((id) => ({ id, name: 'Read', arguments: '{}' })),
++    },
++    ...ids.map((id, i) => ({
++      index: i + 2,
++      role: 'tool' as const,
++      text: `result ${id}`,
++      is_error: false,
++      chars: `result ${id}`.length,
++      tool_call_id: id,
++    })),
++  ];
++}
++
++describe('validatePruneDecision', () => {
++  it('accepts a decision whose ids all exist with arrived results', () => {
++    const raw: RawPruneDecision = {
++      dropCalls: ['c1'],
++      truncateResults: [{ toolCallId: 'c2', headChars: 300 }],
++      note: 'kept what matters',
++    };
++
++    const validation = validatePruneDecision(raw, historyWithExchanges('c1', 'c2'));
++
++    expect(validation).toEqual({
++      ok: true,
++      decision: {
++        dropCalls: ['c1'],
++        truncateResults: [{ toolCallId: 'c2', headChars: 300 }],
++        note: 'kept what matters',
++      },
++    });
++  });
++
++  it('rejects an unknown tool call id', () => {
++    const validation = validatePruneDecision(
++      { dropCalls: ['missing'], truncateResults: [] },
++      historyWithExchanges('c1'),
++    );
++
++    expect(validation.ok).toBe(false);
++    if (!validation.ok) expect(validation.reason).toContain('unknown tool call id "missing"');
++  });
++
++  it('rejects a call whose result has not arrived', () => {
++    const messages: HookMessage[] = [
++      {
++        index: 0,
++        role: 'assistant',
++        text: '',
++        is_error: false,
++        chars: 0,
++        tool_calls: [{ id: 'open1', name: 'Bash', arguments: '{}' }],
++      },
++    ];
++
++    const validation = validatePruneDecision(
++      { dropCalls: ['open1'], truncateResults: [] },
++      messages,
++    );
++
++    expect(validation.ok).toBe(false);
++    if (!validation.ok) expect(validation.reason).toContain('open tool exchange');
++  });
++
++  it('rejects duplicate ids across the two lists', () => {
++    const validation = validatePruneDecision(
++      {
++        dropCalls: ['c1'],
++        truncateResults: [{ toolCallId: 'c1', headChars: 10 }],
++      },
++      historyWithExchanges('c1', 'c2'),
++    );
++
++    expect(validation.ok).toBe(false);
++    if (!validation.ok) expect(validation.reason).toContain('duplicate id "c1"');
++  });
++
++  it('rejects duplicate ids within dropCalls', () => {
++    const validation = validatePruneDecision(
++      { dropCalls: ['c1', 'c1'], truncateResults: [] },
++      historyWithExchanges('c1'),
++    );
++
++    expect(validation.ok).toBe(false);
++    if (!validation.ok) expect(validation.reason).toContain('duplicate id "c1"');
++  });
++
++  it('rejects negative and non-integer headChars', () => {
++    for (const headChars of [-1, 2.5]) {
++      const validation = validatePruneDecision(
++        { dropCalls: [], truncateResults: [{ toolCallId: 'c1', headChars }] },
++        historyWithExchanges('c1'),
++      );
++      expect(validation.ok).toBe(false);
++      if (!validation.ok) expect(validation.reason).toContain('bad headChars');
++    }
++  });
++
++  it('accepts an empty decision', () => {
++    const validation = validatePruneDecision(
++      { dropCalls: [], truncateResults: [] },
++      historyWithExchanges('c1'),
++    );
++
++    expect(validation.ok).toBe(true);
++    if (validation.ok) {
++      expect(validation.decision.dropCalls).toEqual([]);
++      expect(validation.decision.truncateResults).toEqual([]);
++    }
++  });
++});
+diff --git a/packages/agent-core-v2/test/features/externalHooks/runner.test.ts b/packages/agent-core-v2/test/features/externalHooks/runner.test.ts
+index 434225c4f..cf1971a6f 100644
+--- a/packages/agent-core-v2/test/features/externalHooks/runner.test.ts
++++ b/packages/agent-core-v2/test/features/externalHooks/runner.test.ts
+@@ -144,6 +144,75 @@ describe('runHook process runner', () => {
+     expect(result.reason).toBe('use rg');
+   });
+ 
++  it('parses a structured prune decision into the hook result', async () => {
++    const result = await runHook(
++      hostProcess,
++      nodeCommand(
++        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { compactionDecision: "prune", prune: { dropCalls: ["c1"], truncateResults: [{ toolCallId: "c2", headChars: 300 }], note: "kept 3/5" } } }));',
++      ),
++      {},
++      { timeout: 5 },
++    );
++
++    expect(result.action).toBe('allow');
++    expect(result.structuredOutput).toBe(true);
++    expect(result.pruneDecision).toEqual({
++      dropCalls: ['c1'],
++      truncateResults: [{ toolCallId: 'c2', headChars: 300 }],
++      note: 'kept 3/5',
++    });
++  });
++
++  it('rejects a prune decision with a negative headChars', async () => {
++    const result = await runHook(
++      hostProcess,
++      nodeCommand(
++        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { compactionDecision: "prune", prune: { dropCalls: ["c1"], truncateResults: [{ toolCallId: "c2", headChars: -1 }] } } }));',
++      ),
++      {},
++      { timeout: 5 },
++    );
++
++    expect(result.action).toBe('allow');
++    expect(result.pruneDecision).toBeUndefined();
++  });
++
++  it('treats an explicit proceed decision as no prune decision', async () => {
++    const result = await runHook(
++      hostProcess,
++      nodeCommand(
++        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { compactionDecision: "proceed", message: "nothing worth pruning" } }));',
++      ),
++      {},
++      { timeout: 5 },
++    );
++
++    expect(result.action).toBe('allow');
++    expect(result.pruneDecision).toBeUndefined();
++  });
++
++  it('yields no prune decision on exit code 2 or non-JSON stdout', async () => {
++    const blocked = await runHook(
++      hostProcess,
++      nodeCommand(
++        'process.stdout.write(JSON.stringify({ hookSpecificOutput: { compactionDecision: "prune", prune: { dropCalls: ["c1"], truncateResults: [] } } })); process.exit(2);',
++      ),
++      {},
++      { timeout: 5 },
++    );
++    expect(blocked.action).toBe('block');
++    expect(blocked.pruneDecision).toBeUndefined();
++
++    const plain = await runHook(
++      hostProcess,
++      nodeCommand('process.stdout.write("not json");'),
++      {},
++      { timeout: 5 },
++    );
++    expect(plain.action).toBe('allow');
++    expect(plain.pruneDecision).toBeUndefined();
++  });
++
+   it('writes the input payload to the hook process stdin as JSON', async () => {
+     const result = await runHook(
+       hostProcess,
+-- 
+2.56.0.windows.4
+
